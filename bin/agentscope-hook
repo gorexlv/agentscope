@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+agentscope-hook — Claude Code / Codex 生命周期钩子
+
+在 Agent 会话结束时，自动清理该会话派生出的子进程
+（MCP server、dev server、language server 等），杜绝残留堆积。
+
+原理：
+  会话进程与其子进程共享同一个进程组（pgid）。
+  hook 执行时，通过扫描进程树找到"祖先链上属于当前会话"的进程组，
+  然后终止那些已经变成孤儿（父进程已死）的组。
+
+被 Claude Code 调用时从 stdin 读取 hook JSON（包含 session_id / cwd 等），
+从环境变量读 CLAUDE_PROJECT_DIR / CLAUDE_SESSION_ID 等。
+"""
+
+import os
+import sys
+import json
+import time
+import signal
+import subprocess
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AGENTSCOPE = os.path.join(HERE, "agentscope")
+
+
+def log(msg):
+    sys.stderr.write(f"[agentscope-hook] {msg}\n")
+
+
+def read_stdin_json():
+    """读取 hook JSON。stdin 可能不关闭（无管道），必须限时读取，否则会挂住。"""
+    import select
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 5.0)
+        if not ready:
+            return {}
+        data = sys.stdin.read()
+        if data.strip():
+            return json.loads(data)
+    except Exception:
+        pass
+    return {}
+
+
+def my_pgid():
+    try:
+        return os.getpgid(0)
+    except Exception:
+        return -1
+
+
+def session_cwds(hook_input):
+    """本次会话涉及的工作目录"""
+    c = set()
+    for k in ("cwd", "project_dir", "workspace_dir"):
+        v = hook_input.get(k)
+        if v and os.path.isdir(v):
+            c.add(os.path.realpath(v))
+    for env in ("CLAUDE_PROJECT_DIR", "CLAUDE_WORKSPACE", "PWD"):
+        v = os.environ.get(env)
+        if v and os.path.isdir(v):
+            c.add(os.path.realpath(v))
+    return c
+
+
+def ancestor_pgids():
+    """
+    本 hook 进程的所有祖先进程组。
+
+    Agent 会话（claude/codex）启动 hook 时，hook 是它的子进程，
+    共享同一个 pgid；hook 再派生的子进程也在该组内。
+    因此「本次会话的 pgid」可以从祖先链上直接取到 —— 这比按 cwd
+    猜测要精确得多，不会误伤同目录下的其他会话残留。
+    """
+    out = set()
+    pid = os.getpid()
+    for _ in range(24):
+        try:
+            pg = os.getpgid(pid)
+        except Exception:
+            break
+        if pg <= 1 or pg in out:
+            break
+        out.add(pg)
+        try:
+            nxt = ppid_of(pid)
+        except Exception:
+            break
+        if nxt <= 1:
+            break
+        pid = nxt
+    return out
+
+
+def ppid_of(pid):
+    """取任意进程的父 PID（libproc 方式，ps 在沙箱内不可用）"""
+    import ctypes
+    libproc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                      ctypes.c_void_p, ctypes.c_int]
+    libproc.proc_pidinfo.restype = ctypes.c_int
+    raw = ctypes.create_string_buffer(1024)
+    r = libproc.proc_pidinfo(pid, 3, 0, raw, 1024)
+    if r <= 0:
+        return 0
+    d = raw.raw[:r]
+    if len(d) < 20:
+        return 0
+    return int.from_bytes(d[16:20], "little", signed=True)
+
+
+def find_session_groups(hook_input):
+    """
+    找出本次会话遗留的进程组。
+
+    优先用祖先链精确匹配（最可靠）；
+    祖先链拿不到时，退化为按工作目录匹配（次优，但更宽松）。
+    """
+    try:
+        r = subprocess.run([AGENTSCOPE, "scan", "--json"],
+                           capture_output=True, text=True, timeout=60)
+        data = json.loads(r.stdout)
+    except Exception as e:
+        log(f"调用 agentscope scan 失败: {e}")
+        return []
+
+    groups = data.get("groups", [])
+    anc = ancestor_pgids()
+
+    # ── 精确路径：祖先 pgid ──
+    if anc:
+        exact = [g for g in groups if g.get("pgid") in anc]
+        if exact:
+            log(f"祖先链命中 pgid: {sorted(anc)}")
+            return _filter_cleanable(exact)
+
+    # ── 退化路径：按工作目录 ──
+    cws = session_cwds(hook_input)
+    if not cws:
+        return []
+    matched = []
+    for g in groups:
+        cwd = g.get("cwd") or ""
+        if not cwd:
+            continue
+        rcwd = os.path.realpath(cwd)
+        for c in cws:
+            if rcwd.startswith(c + os.sep) or c.startswith(rcwd + os.sep) or rcwd == c:
+                matched.append(g)
+                break
+    if matched:
+        log(f"按工作目录匹配到 {len(matched)} 个组（未命中祖先链）")
+    return _filter_cleanable(matched)
+
+
+def _filter_cleanable(groups):
+    """只保留确认是残留、且可以安全清理的组"""
+    out = []
+    for g in groups:
+        if not g.get("orphan"):
+            continue
+        if g.get("protected"):
+            continue
+        if g.get("has_live_session"):
+            continue
+        if g.get("ports"):
+            continue
+        out.append(g)
+    return out
+
+
+def cleanup(groups):
+    """终止指定进程组"""
+    cleaned = 0
+    for g in groups:
+        pgid = g["pgid"]
+        members = g.get("members", [])
+        # 二次校验：组内若出现 Agent 本体，说明会话还活着 —— 放弃清理
+        live_agent = [p for p in members if _is_agent_main(p)]
+        if live_agent:
+            log(f"跳过 pgid {pgid}：检测到活跃 Agent 进程 {live_agent}")
+            continue
+        # 优先 killpg；受限环境下会 EPERM，此时降级为逐进程终止
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            for pid in reversed(members):   # 先子后父
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        # 等一会，若还有残留则升级
+        time.sleep(0.8)
+        try:
+            os.killpg(pgid, 0)
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            for pid in reversed(members):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        cleaned += len(members)
+        log(f"已清理 pgid {pgid} ({len(members)} 进程) @ {g.get('cwd','')}")
+    return cleaned
+
+
+_AGENT_MAIN = ("claude", "codex", "zcode-cli", "kimi-code", "cursor-agent",
+               "opencode", "aider", "gemini")
+
+
+def _is_agent_main(pid):
+    """判断 PID 是否为 Agent 本体进程"""
+    try:
+        import ctypes
+        libproc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                          ctypes.c_void_p, ctypes.c_int]
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        raw = ctypes.create_string_buffer(1024)
+        r = libproc.proc_pidinfo(pid, 3, 0, raw, 1024)
+        if r <= 0:
+            return False
+        d = raw.raw[:r]
+        if len(d) < 96:
+            return False
+        comm = d[48:64].split(b"\0")[0].decode(errors="replace").lower()
+        name = d[64:96].split(b"\0")[0].decode(errors="replace").lower()
+        hay = comm + " " + name
+        return any(m in hay for m in _AGENT_MAIN)
+    except Exception:
+        return False
+
+
+def main():
+    action = sys.argv[1] if len(sys.argv) > 1 else ""
+    if action not in ("session-end", "subagent-stop", "scan"):
+        # 无参调用：直接退出，绝不阻塞会话
+        return 0
+    hook_input = read_stdin_json()
+
+    if action in ("session-end", "subagent-stop"):
+        reason = hook_input.get("reason", "")
+        log(f"会话结束 (reason={reason or 'n/a'})")
+
+        groups = find_session_groups(hook_input)
+        if not groups:
+            log("未发现本次会话的残留进程组，无需清理。")
+            return 0
+
+        total = sum(len(g.get("members", [])) for g in groups)
+        log(f"发现 {len(groups)} 个残留进程组，共 {total} 个进程")
+        n = cleanup(groups)
+        log(f"清理完成，回收 {n} 个进程。")
+    elif action == "scan":
+        groups = find_session_groups(hook_input)
+        print(json.dumps(groups, ensure_ascii=False, indent=2))
+    else:
+        log(f"未知 action: {action}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        # hook 绝不能因为异常而阻塞会话
+        log(f"异常（已忽略）: {e}")
+        sys.exit(0)
