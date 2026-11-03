@@ -21,6 +21,7 @@ import time
 
 HOME = os.path.expanduser("~")
 BIN_DIR = os.path.join(HOME, ".local", "bin")
+LIB_DIR = os.path.join(HOME, ".local", "lib")
 STATE_DIR = os.path.join(HOME, ".local", "state", "agentscope")
 LAUNCH_DIR = os.path.join(HOME, "Library", "LaunchAgents")
 
@@ -75,6 +76,27 @@ def install_bins(dry=False):
         os.chmod(dst, 0o755)
         installed.append(dst)
         log(f"  ✓ {dst}")
+
+    # 安装 Python 包（Agent 监控模块）
+    # 装到 ~/.local/lib/agentscope_lib/ 而不是 ~/.local/bin/ —— 否则会与
+    # 可执行文件 agentscope 同名冲突（一个是目录一个是文件）
+    pkg_src = os.path.join(SRC_DIR, "agentscope_lib")
+    pkg_dst = os.path.join(LIB_DIR, "agentscope_lib")
+    if os.path.isdir(pkg_src):
+        if dry:
+            log(f"  [dry-run] 将安装 Python 包 -> {pkg_dst}")
+        else:
+            if os.path.isdir(pkg_dst):
+                shutil.rmtree(pkg_dst)
+            shutil.copytree(pkg_src, pkg_dst)
+            # 清理可能存在的 __pycache__
+            for root, dirs, files in os.walk(pkg_dst):
+                for d in list(dirs):
+                    if d == "__pycache__":
+                        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                        dirs.remove(d)
+            installed.append(pkg_dst)
+            log(f"  ✓ {pkg_dst}/ (Agent 监控模块)")
     return installed
 
 
@@ -266,7 +288,7 @@ def install_watchdog(interval=120, dry=False):
 def uninstall(dry=False):
     log("\n卸载 agentscope\n")
 
-    # 移除可执行文件
+    # 移除可执行文件与 Python 包
     for name in ("agentscope", "agentscope-hook", "codex-notify-wrapper.sh"):
         p = os.path.join(BIN_DIR, name)
         if os.path.exists(p):
@@ -275,6 +297,14 @@ def uninstall(dry=False):
             else:
                 os.unlink(p)
                 log(f"  ✓ 已删除 {p}")
+
+    pkg = os.path.join(LIB_DIR, "agentscope_lib")
+    if os.path.isdir(pkg):
+        if dry:
+            log(f"  [dry-run] 将删除 {pkg}/")
+        else:
+            shutil.rmtree(pkg)
+            log(f"  ✓ 已删除 {pkg}/")
 
     # 移除 Claude hook
     if os.path.exists(CLAUDE_SETTINGS):

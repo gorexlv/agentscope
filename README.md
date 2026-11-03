@@ -25,6 +25,8 @@ python3 install/install.py
 
 安装后即可使用：
 
+### 进程清理
+
 ```bash
 agentscope scan                # 列出Agent 会话与残留进程组
 agentscope tree <pgid>         # 展开某个进程组看构成
@@ -32,6 +34,63 @@ agentscope clean --dry-run     # 预演清理
 agentscope clean --yes         # 执行清理
 agentscope watch --interval 60 # 守护模式（前台）
 ```
+
+### AI Agent 会话监控
+
+参考 [ctop](https://github.com/aakashadesara/ctop) 的设计，单终端面板监控
+Claude Code / Codex CLI / OpenCode / Devin 会话。
+
+```bash
+agentscope panel                # 交互式面板（默认 3s 刷新）
+agentscope agents               # 列出所有 Agent 会话
+agentscope agents --alerts      # 同时显示告警
+agentscope agents --json        # JSON 输出（给脚本用）
+agentscope node                 # node/Electron 内存与堆上限诊断
+agentscope stats                # 跨会话汇总（token / 成本 / 内存）
+agentscope alerts               # 只显示需要关注的会话
+agentscope whoami               # 检测当前终端处于哪个 Agent 会话
+```
+
+面板输出示例：
+
+```
+    PID AGENT        CPU       MEM   CTX    TOKENS     COST MODEL                  BRANCH             CWD
+────────────────────────────────────────────────────────────────────────────────────────────────────
+* 68220 claude    11%   364M      65%   159       $0.04    claude-opus-5-5        main               …adastralab-ai/money
+* 57705 claude    8%    309M      32%   452       $0.08    claude-opus-5-5        orca/PM-2          ~/orca/workspaces/mo-/PM-2
+  57815 claude    0%    843M        -       -         -    claude-opus-5-5        orca/PM-2          ~/orca/workspaces/mo-/PM-2
+```
+
+`*` 是会话主进程（承载 token 与成本），空格是子进程（Helper / Renderer）——
+子进程共享同一份会话文件，计费只算主进程，避免重复统计。
+
+### node 堆上限诊断
+
+AI 编程时大量启用 worktree 并行，或同时编译 TS/JS，若 node 堆上限设得太大
+（`--max-old-space-size=8192` 之类），内存占用会非常高。
+
+```bash
+agentscope node
+```
+
+```
+node / Electron 内存占用
+  14 个进程 · 合计 0.82 GB · 配置了堆上限的 1 个 · 最大 16384 MB
+
+      PID       MEM      HEAP ROLE              WORKTREE
+  ──────────────────────────────────────────────────────
+    50142 414M      -         dev-server        ~/orca/workspaces/orch
+    49815 48M   16384MB   runtime           /
+
+诊断
+  ● HEAP_LIMIT_HIGH: 堆上限 16384 MB 偏大（--max-old-space-size），实际占用 48 MB
+      → 建议降到 2048 MB（NODE_OPTIONS=--max-old-space-size=2048）
+```
+
+诊断规则：
+- `HEAP_LIMIT_HIGH` — 堆上限 ≥ 4 GB
+- `TOO_MANY_INSTANCES` — 同一 worktree 下 node 实例 ≥ 6 个
+- `TOTAL_MEM_HIGH` — node 类进程总占用 ≥ 4 GB
 
 卸载：
 

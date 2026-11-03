@@ -32,7 +32,15 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+# 让脚本无论从哪里调用都能找到 agentscope_lib 包
+# 优先级：① 同级仓库目录（开发态）  ② ~/.local/lib（安装态）
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _cand in (_PKG_DIR, os.path.join(os.path.expanduser("~"), ".local", "lib")):
+    if os.path.isdir(os.path.join(_cand, "agentscope_lib")) and _cand not in sys.path:
+        sys.path.insert(0, _cand)
+        break
+
+VERSION = "1.1.0"
 
 # ─────────────────────────────────────────────────────────────
 # libproc 绑定：绕过 ps/top 的沙箱限制，直接读内核进程表
@@ -792,6 +800,13 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--keep-ports", action="store_true", default=True)
     p.set_defaults(func=cmd_watch)
+
+    # Agent 会话监控子命令（agents / panel / node / stats / alerts / whoami）
+    try:
+        from agentscope_lib.cli import register as _register_agent_cmds
+        _register_agent_cmds(sub)
+    except ImportError as e:
+        print(f"提示：Agent 监控子命令不可用（{e}）", file=sys.stderr)
 
     args = ap.parse_args()
     return args.func(args)
