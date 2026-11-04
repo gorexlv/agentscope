@@ -17,15 +17,55 @@ from . import render
 from . import sessions
 
 
+def system_load():
+    """系统负载摘要 —— 与会话视图放在一起，便于对照"""
+    import subprocess as sp
+    try:
+        out = sp.run(["sysctl", "-n", "vm.loadavg"], capture_output=True,
+                     text=True, timeout=10).stdout.strip()
+        load = [float(x) for x in out.strip("{} ").split()]
+        cores = int(sp.run(["sysctl", "-n", "hw.ncpu"], capture_output=True,
+                           text=True, timeout=10).stdout.strip() or 1)
+    except Exception:
+        return None
+    if not load:
+        return None
+    return {
+        "load_1m": load[0],
+        "load_5m": load[1] if len(load) > 1 else None,
+        "load_15m": load[2] if len(load) > 2 else None,
+        "cores": cores,
+        "busy_pct": round(min(100.0, load[0] / cores * 100), 1),
+    }
+
+
 def cmd_agents(args):
     """列出 Agent 会话"""
     sess = agents_mod.collect(context_limit=args.context_limit,
                               with_resources=not args.fast)
+    # 按指定字段排序（看 CPU load 时用 --sort cpu）
+    key = getattr(args, "sort", "mem")
+    if key == "cpu":
+        sess.sort(key=lambda r: -(r.get("cpu_pct") or 0))
+    elif key == "mem":
+        sess.sort(key=lambda r: -(r.get("mem_mb") or 0))
+    elif key == "ctx":
+        sess.sort(key=lambda r: (r.get("context_pct") is None,
+                                 r.get("context_pct") or 0))
+    elif key == "cost":
+        sess.sort(key=lambda r: -(r.get("cost") or 0))
+    elif key == "tokens":
+        sess.sort(key=lambda r: -((r.get("input_tokens") or 0) +
+                                   (r.get("output_tokens") or 0)))
     if args.json:
         print(json.dumps(sess, ensure_ascii=False, indent=2, default=str))
         return 0
 
     print()
+    sl = system_load()
+    if sl:
+        print(render.load_line(sl))
+        print()
     print(render.session_table(sess))
     print()
     t = agents_mod.totals(sess)
@@ -51,8 +91,12 @@ def cmd_panel(args):
 
             w = render.term_width()
             sys.stdout.write(render.CLEAR)
-            sys.stdout.write(f"{render.BOLD}agentscope{RESET} "
-                             f"{render.GRAY}— AI Agent 会话监控{RESET}\n\n")
+            sys.stdout.write(f"{render.BOLD}agentscope{render.RESET} "
+                             f"{render.GRAY}— AI Agent 会话监控{render.RESET}\n\n")
+
+            sl = system_load()
+            if sl:
+                sys.stdout.write(render.load_line(sl) + "\n\n")
 
             if node_rows is not None:
                 sys.stdout.write(render.node_section(node_rows, w) + "\n\n")
@@ -219,6 +263,9 @@ def register(sub):
     p.add_argument("--fast", action="store_true", help="跳过 CPU/内存采集（更快）")
     p.add_argument("--context-limit", type=int, default=200000,
                    help="上下文窗口上限，用于计算剩余比例")
+    p.add_argument("--sort", default="mem",
+                   choices=["cpu", "mem", "ctx", "cost", "tokens"],
+                   help="排序依据（默认按内存降序）")
     p.set_defaults(func=cmd_agents)
 
     p = sub.add_parser("panel", help="交互式监控面板")

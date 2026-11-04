@@ -192,6 +192,11 @@ def parse_claude_session(path, context_limit=DEFAULT_CONTEXT_LIMIT):
         msg = d.get("message") or {}
         usage = msg.get("usage")
         if usage:
+            # <synthetic> 是 Claude Code 给非 LLM 生成消息（本地命令输出等）用的
+            # 占位模型，usage 全为 0。跳过它，继续往前找真实的一次调用。
+            model = msg.get("model")
+            if model == "<synthetic>":
+                continue
             inp = usage.get("input_tokens") or 0
             cc = usage.get("cache_creation_input_tokens") or 0
             cr = usage.get("cache_read_input_tokens") or 0
@@ -204,7 +209,7 @@ def parse_claude_session(path, context_limit=DEFAULT_CONTEXT_LIMIT):
                 "cache_read_tokens": cr,
                 "context_used": used,
                 "context_pct": max(0, min(100, round((context_limit - used) / context_limit * 100))),
-                "model": msg.get("model"),
+                "model": model,
                 "stop_reason": msg.get("stop_reason"),
                 "git_branch": d.get("gitBranch"),
                 "cwd": d.get("cwd"),

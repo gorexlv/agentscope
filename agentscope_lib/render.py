@@ -170,7 +170,8 @@ def session_table(sess_list, w=None):
     """会话明细表"""
     w = w or term_width()
     out = []
-    header = (f"{'  PID':>7} {'AGENT':<9} {'CPU':>6} {'MEM':>9} {'CTX':>5} "
+    # CPU% 是「单核占用率」（100% = 吃满一个核），不是整机占比
+    header = (f"{'  PID':>7} {'AGENT':<9} {'CPU*':>6} {'MEM':>9} {'CTX':>5} "
               f"{'TOKENS':>9} {'COST':>8} {'MODEL':<22} {'BRANCH':<18} CWD")
     out.append(f"{BOLD}{header}{RESET}")
     out.append(f"{GRAY}{'─' * min(len(header), w)}{RESET}")
@@ -216,6 +217,14 @@ def session_table(sess_list, w=None):
             f"{GRAY}{short_cwd(s.get('cwd'), 36)}{RESET}"
         )
         out.append(row)
+
+    # 脚注：解释 CPU% 的含义与合计
+    total_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list)
+    main_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list
+                   if s.get("is_main", True))
+    out.append(f"{GRAY}  CPU* 为单核占用率（100% = 吃满一核）· "
+               f"会话合计 {total_cpu:.0f}% "
+               f"（主进程 {main_cpu:.0f}%）{RESET}")
     return "\n".join(out)
 
 
@@ -264,6 +273,26 @@ def node_section(rows, w=None):
     if len(rows) > 14:
         out.append(f"{GRAY}  ...另 {len(rows) - 14} 个{RESET}")
     return "\n".join(out)
+
+
+def load_line(sl):
+    """系统负载摘要行 —— 与会话视图对照"""
+    if not sl:
+        return ""
+    l1 = sl.get("load_1m", 0)
+    cores = sl.get("cores", 1)
+    busy = sl.get("busy_pct", 0)
+    color = RED if busy >= 80 else (YELLOW if busy >= 50 else GREEN)
+    bar_n = int(busy / 5)
+    bar = "█" * bar_n + "░" * (20 - bar_n)
+    return (
+        f"{BOLD}系统负载{RESET}  "
+        f"{color}{bar} {busy:.0f}%{RESET}  "
+        f"{GRAY}load{RESET} {l1:.2f} "
+        f"{GRAY}(1m) / {sl.get('load_5m', 0):.2f} (5m) / "
+        f"{sl.get('load_15m', 0):.2f} (15m){RESET}  "
+        f"{GRAY}· {cores} 核{RESET}"
+    )
 
 
 def summary_line(t):
