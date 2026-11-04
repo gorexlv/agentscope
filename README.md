@@ -64,6 +64,34 @@ agentscope whoami               # 检测当前终端处于哪个 Agent 会话
 `*` 是会话主进程（承载 token 与成本），空格是子进程（Helper / Renderer）——
 子进程共享同一份会话文件，计费只算主进程，避免重复统计。
 
+### 持续监控
+
+`--watch` 让任意视图按间隔刷新：
+
+```bash
+agentscope agents --watch                      # 持续看会话状态
+agentscope agents --watch --sort cpu           # 按 CPU 排序持续监控
+agentscope node --watch                        # 持续看 node 内存
+agentscope scan --watch                        # 持续看进程组变化
+agentscope agents --watch --interval 1         # 1 秒刷新
+agentscope agents --watch --no-clear           # 不清屏，逐块追加（适合管道）
+agentscope agents --watch --iterations 10      # 刷 10 轮后退出
+```
+
+与 `panel` 的区别：
+
+| | `panel` | `--watch` |
+|---|---|---|
+| 形态 | 交互式 TUI，全屏重绘 | 轻量，同一块内容按间隔刷新 |
+| 附带信息 | node 内存段 + 告警 | 只输出该视图的内容 |
+| 管道友好 | 否 | `--no-clear` 后可以 |
+
+`--watch` 适合放进另一个终端分屏，或配合 `grep` / `awk` 处理：
+
+```bash
+agentscope agents --watch --no-clear | grep -E "claude|codex"
+```
+
 ### node 堆上限诊断
 
 AI 编程时大量启用 worktree 并行，或同时编译 TS/JS，若 node 堆上限设得太大

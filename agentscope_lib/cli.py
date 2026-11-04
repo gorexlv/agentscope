@@ -15,6 +15,11 @@ from . import nodeheap
 from . import procstat
 from . import render
 from . import sessions
+from . import watch as watch_mod
+
+# 直接导入 ANSI 常量：写 RESET 容易漏掉 render. 前缀而变成 NameError
+from .render import BOLD, DIM, GRAY, RED, GREEN, YELLOW, CYAN, RESET
+from .render import load_line, summary_line
 
 
 def system_load():
@@ -61,21 +66,54 @@ def cmd_agents(args):
         print(json.dumps(sess, ensure_ascii=False, indent=2, default=str))
         return 0
 
+    def render_all(data):
+        sl = system_load()
+        parts = []
+        if sl:
+            parts.append(load_line(sl))
+            parts.append("")
+        parts.append(render.session_table(data))
+        parts.append("")
+        t = agents_mod.totals(data)
+        parts.append(summary_line(t))
+        if args.alerts:
+            al = agents_mod.alerts(data)
+            if al:
+                parts.append("")
+                parts.append(render.alerts_section(al))
+        return "\n".join(parts)
+
+    if getattr(args, "watch", False):
+        def collect():
+            d = agents_mod.collect(context_limit=args.context_limit,
+                                   with_resources=not args.fast)
+            return sort_sessions(d, args.sort)
+        return watch_mod.run_watch(
+            collect, render_all,
+            interval=getattr(args, "interval", 3),
+            clear=not getattr(args, "no_clear", False),
+            iterations=getattr(args, "iterations", 0))
+
     print()
-    sl = system_load()
-    if sl:
-        print(render.load_line(sl))
-        print()
-    print(render.session_table(sess))
-    print()
-    t = agents_mod.totals(sess)
-    print(render.summary_line(t))
-    if args.alerts:
-        al = agents_mod.alerts(sess)
-        if al:
-            print()
-            print(render.alerts_section(al))
+    print(render_all(sess))
     return 0
+
+
+def sort_sessions(sess, key):
+    """按指定字段排序"""
+    if key == "cpu":
+        sess.sort(key=lambda r: -(r.get("cpu_pct") or 0))
+    elif key == "mem":
+        sess.sort(key=lambda r: -(r.get("mem_mb") or 0))
+    elif key == "ctx":
+        sess.sort(key=lambda r: (r.get("context_pct") is None,
+                                 r.get("context_pct") or 0))
+    elif key == "cost":
+        sess.sort(key=lambda r: -(r.get("cost") or 0))
+    elif key == "tokens":
+        sess.sort(key=lambda r: -((r.get("input_tokens") or 0) +
+                                   (r.get("output_tokens") or 0)))
+    return sess
 
 
 def cmd_panel(args):
@@ -91,8 +129,8 @@ def cmd_panel(args):
 
             w = render.term_width()
             sys.stdout.write(render.CLEAR)
-            sys.stdout.write(f"{render.BOLD}agentscope{render.RESET} "
-                             f"{render.GRAY}— AI Agent 会话监控{render.RESET}\n\n")
+            sys.stdout.write(f"{BOLD}agentscope{RESET} "
+                             f"{GRAY}— AI Agent 会话监控{RESET}\n\n")
 
             sl = system_load()
             if sl:
@@ -113,19 +151,43 @@ def cmd_panel(args):
                     {"level": i["level"], "kind": i["kind"], "msg": i["msg"]}
                     for i in issues]) + "\n")
 
-            sys.stdout.write(f"{render.GRAY}刷新间隔 {interval}s · Ctrl-C 退出{RESET}")
+            sys.stdout.write(f"{GRAY}刷新间隔 {interval}s · Ctrl-C 退出{RESET}")
             sys.stdout.flush()
             time.sleep(interval)
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write(render.SHOW_CURSOR + render.RESET + "\n")
+        sys.stdout.write(render.SHOW_CURSOR + RESET + "\n")
         sys.stdout.flush()
     return 0
 
 
 def cmd_node(args):
     """node 内存与堆上限诊断"""
+    def render_node(rows):
+        parts = [render.node_section(rows), ""]
+        issues = nodeheap.diagnose(rows)
+        if issues:
+            parts.append(BOLD + "诊断" + RESET)
+            for i in issues:
+                color = RED if i["level"] == "warn" else YELLOW
+                parts.append(f"  {color}*{RESET} {i['kind']:<22} {i['msg']}")
+                if i.get("suggest"):
+                    parts.append(f"      → {i['suggest']}")
+            parts.append("")
+        else:
+            parts.append(f"{GRAY}  未发现堆上限或并行实例问题{RESET}\n")
+        return "\n".join(parts)
+
+    if getattr(args, "watch", False):
+        def collect():
+            return nodeheap.collect()
+        return watch_mod.run_watch(
+            collect, render_node,
+            interval=getattr(args, "interval", 3),
+            clear=not getattr(args, "no_clear", False),
+            iterations=getattr(args, "iterations", 0))
+
     rows = nodeheap.collect()
     if args.json:
         print(json.dumps({
@@ -137,19 +199,7 @@ def cmd_node(args):
         return 0
 
     print()
-    print(render.node_section(rows))
-    print()
-    issues = nodeheap.diagnose(rows)
-    if issues:
-        print(render.BOLD + "诊断" + render.RESET)
-        for i in issues:
-            color = render.RED if i["level"] == "warn" else render.YELLOW
-            print(f"  {color}●{render.RESET} {i['kind']:<22} {i['msg']}")
-            if i.get("suggest"):
-                print(f"      → {i['suggest']}")
-        print()
-    else:
-        print(f"{render.GRAY}  未发现堆上限或并行实例问题{render.RESET}\n")
+    print(render_node(rows))
     return 0
 
 
@@ -162,7 +212,7 @@ def cmd_stats(args):
         return 0
 
     print()
-    print(f"{render.BOLD}跨会话汇总{render.RESET}\n")
+    print(f"{BOLD}跨会话汇总{RESET}\n")
     print(f"  会话数      {t['sessions']}")
     print(f"  输入 token  {sessions.format_tokens(t['input_tokens'])}")
     print(f"  输出 token  {sessions.format_tokens(t['output_tokens'])}")
@@ -192,7 +242,7 @@ def cmd_alerts(args):
         return 0
     print()
     if not al:
-        print(f"{render.GRAY}  没有需要关注的会话{render.RESET}\n")
+        print(f"{GRAY}  没有需要关注的会话{RESET}\n")
         return 0
     print(render.alerts_section(al))
     print()
@@ -237,12 +287,12 @@ def cmd_whoami(args):
         return 0
 
     if not found:
-        print(f"\n  {render.GRAY}当前终端不在任何 Agent 会话中{render.RESET}\n")
+        print(f"\n  {GRAY}当前终端不在任何 Agent 会话中{RESET}\n")
         return 1
 
     print()
-    print(f"  {render.BOLD}当前会话{render.RESET}  "
-          f"{render.GRAY}(匹配方式: {confidence}){render.RESET}\n")
+    print(f"  {BOLD}当前会话{RESET}  "
+          f"{GRAY}(匹配方式: {confidence}){RESET}\n")
     ctx = found.get("context_pct")
     print(f"    PID       {found['pid']}")
     print(f"    类型      {found['agent_type']}")
@@ -266,6 +316,14 @@ def register(sub):
     p.add_argument("--sort", default="mem",
                    choices=["cpu", "mem", "ctx", "cost", "tokens"],
                    help="排序依据（默认按内存降序）")
+    p.add_argument("--watch", action="store_true",
+                   help="持续监控，按间隔刷新")
+    p.add_argument("--interval", type=int, default=3,
+                   help="--watch 的刷新间隔（秒）")
+    p.add_argument("--no-clear", action="store_true",
+                   help="--watch 时不清屏，逐块追加（适合管道）")
+    p.add_argument("--iterations", type=int, default=0,
+                   help="--watch 刷新多少轮后退出（0 = 无限）")
     p.set_defaults(func=cmd_agents)
 
     p = sub.add_parser("panel", help="交互式监控面板")
@@ -278,6 +336,14 @@ def register(sub):
 
     p = sub.add_parser("node", help="node/Electron 内存与堆上限诊断")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--watch", action="store_true",
+                   help="持续监控，按间隔刷新")
+    p.add_argument("--interval", type=int, default=3,
+                   help="--watch 的刷新间隔（秒）")
+    p.add_argument("--no-clear", action="store_true",
+                   help="--watch 时不清屏，逐块追加（适合管道）")
+    p.add_argument("--iterations", type=int, default=0,
+                   help="--watch 刷新多少轮后退出（0 = 无限）")
     p.set_defaults(func=cmd_node)
 
     p = sub.add_parser("stats", help="跨会话汇总统计")
