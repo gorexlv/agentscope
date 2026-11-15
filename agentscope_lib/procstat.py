@@ -70,6 +70,7 @@ def proc_bsdinfo(pid):
     if len(d) < 96:
         return None
     return {
+        "start_time": _i64(d, 120) * 1000000 + _i64(d, 128) if len(d) >= 136 else 0,
         "pid": _i32(d, 12),
         "ppid": _i32(d, 16),
         "uid": _i32(d, 20),
@@ -124,6 +125,14 @@ def scan_processes():
             b["pgid"] = proc_pgid(pid)
             b["path"] = proc_path(pid)
             out[pid] = b
+    try:
+        result = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in out:
+                out[int(parts[0])]['cmdline'] = parts[1]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     return out
 
 

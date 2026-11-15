@@ -279,6 +279,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             rec["is_main"] = _is_session_main(b)
             if rec["is_main"]:
                 rec.update(data)
+                rec["cost_estimated"] = sessions.cost_estimated(rec["model"])
                 rec["cost"] = sessions.calculate_cost(
                     rec["model"], rec["input_tokens"], rec["output_tokens"],
                     rec["cache_create_tokens"], rec["cache_read_tokens"], at)
@@ -335,13 +336,13 @@ def totals(sess_list):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_create_tokens": 0,
         "cost": 0.0, "mem_mb": 0.0, "cpu_pct": 0.0,
-        "by_type": {},
+        "by_type": {}, "cost_estimated": False,
     }
     for s in sess_list:
         # 内存 / CPU 是进程级的，全部累加
         t["mem_mb"] += s.get("mem_mb") or 0.0
         t["cpu_pct"] += s.get("cpu_pct") or 0.0
-        bt = t["by_type"].setdefault(s["agent_type"], {"n": 0, "cost": 0.0, "mem": 0.0})
+        bt = t["by_type"].setdefault(s["agent_type"], {"n": 0, "cost": 0.0, "mem": 0.0, "cost_estimated": False})
         bt["n"] += 1
         bt["mem"] += s.get("mem_mb") or 0.0
         # token 与成本是会话级的 —— 只算主进程，避免同一会话重复计费
@@ -351,6 +352,8 @@ def totals(sess_list):
         t["output_tokens"] += s.get("output_tokens") or 0
         t["cache_read_tokens"] += s.get("cache_read_tokens") or 0
         t["cache_create_tokens"] += s.get("cache_create_tokens") or 0
+        t["cost_estimated"] |= bool(s.get("cost_estimated"))
+        bt["cost_estimated"] |= bool(s.get("cost_estimated"))
         t["cost"] += s.get("cost") or 0.0
         bt["cost"] += s.get("cost") or 0.0
     # 会话数按主进程计

@@ -6,11 +6,11 @@
 
 ```
 bin/agentscope              主 CLI
-├── libproc 绑定            读内核进程表（绕过 ps/top 的沙箱限制）
+├── agentscope_lib.procstat 唯一 libproc / cwd / 端口采集实现
 ├── 进程组聚合              按 pgid 组织进程
 ├── 残留判别                orphan / agent_like / has_live_session
 ├── 三重安全阀protected / live_session / 端口占用
-└── kill 策略               killpg 优先，EPERM 时降级逐进程
+└── agentscope_lib.cleanup  分类、保护、审计与逐成员清理入口
 
 bin/agentscope-hook         Claude Code SessionEnd 钩子
 ├── 祖先链精确匹配          优先用 pgid 定位本次会话
@@ -52,16 +52,17 @@ Electron 的 `(Renderer)` 也被误伤。
 
 ### 最终判据
 
-两条**同时成立**才算残留：
+所有根节点满足三条条件才算残留：
 
 1. 根进程自身是 shell / 开发工具：`bash` `zsh` `fish` `sh` `node` `python3` `head` `tail` `deno` `bun`
 2. 根进程的 **cwd 落在工作区目录内**
+3. 根进程 ppid 为 1 或父进程不在快照中；活父进程即使不同 pgid 也不能清理
 
 桌面应用的 cwd 是 `/` 或 `.app` 内部路径，天然不满足条件。
 
 ```
 WORKSPACE_ROOTS = (
-    ~/Workspace, ~/Worksapce,        # 注意：本机存在拼写错误目录
+    ~/Workspace, ~/Worksapce, ~/Workbuddy,        # 注意：本机存在拼写错误目录
     ~/orca/workspaces, ~/.codex/worktrees, ~/.claude,
     ~/Desktop, ~/Documents, ~/Projects,
 )
@@ -107,18 +108,14 @@ n/
 即 `p<pid>` 后跟 `n<path>`。**不能用默认表格格式解析**（那需要按列位置切分，
 路径含空格会错位）。
 
-## kill 策略：killpg 在受限环境会失败
+## 清理与进程身份
 
-沙箱不允许进程影响其它进程组，`killpg` 返回 `EPERM`：
-
-```python
-try:
-    os.killpg(pgid, signal.SIGTERM)
-except PermissionError:
-    # 降级：逐进程终止
-```
-
-降级时必须**先子后父**（`_children_first`）——父进程先死会让子进程变成孤儿。
+`bin/agentscope` 仅保留包路径引导与 CLI 入口；实现集中在 `cleanup.py`。
+`kill_group` 重新分析快照，要求候选成员 PID + 内核启动时间与确认时相同。
+仅允许当前 uid、已知启动时间、无监听端口且无任何保护条件的组。
+先写审计 attempt，再按进程树深度从子到父发送 TERM；超时再发送 KILL。
+每次信号前核对 PID、启动时间和 pgid；不向新加入的成员广播 killpg。
+检查与信号之间仍有无法用标准库完全消除的竞态窗口。
 
 ## 三重安全阀
 
@@ -155,7 +152,7 @@ while pid > 1:
 | 限制 | 表现 | 绕法 |
 |---|---|---|
 | `ps` / `top` 被禁 | `PermissionError: [Errno 1]` | libproc `proc_listallpids` + `proc_pidinfo` |
-| `killpg` EPERM | 无法影响其它进程组 | 降级逐进程 kill |
+| 信号 EPERM | 进程权限限制 | 保留 remaining 审计结果 |
 | `launchctl bootstrap` errno 5 | 无法立即加载 launchd agent | `launchctl enable` + 登录时自动加载 |
 | Python `open()` 被拦 | 写入路径被当成文件名 | 用 Write 工具写文件 |
 | `os.unlink` 被拦 | 转 trash broker，某些路径抛 errno 66 | 用 `/bin/rm` 子进程 |
@@ -173,3 +170,16 @@ pbi_comm   @48  (16 bytes)   pbi_name @64 (32 bytes)
 ```
 
 `pbi_comm` 是进程名（截断到16 字节），`pbi_name` 是完整路径名。
+
+## Hardening 模块与状态
+
+- `config.py`：JSON 类型校验、工作区边界、保护规则。路径 `AGENTSCOPE_CONFIG` > 默认路径；工作区环境变量优先。非法配置失败关闭；命令行未知且存在命令行保护规则时保护成员。
+- `procstat.py`：统一内核枚举，`pbi_start_tvsec@120` / `tvusec@128` 合成微秒启动身份；批量 ps 仅补充完整命令行，失败时不猜测。
+- `history.py`：0600 JSONL append，kills 记录 attempt/dry-run/skipped/cleaned/gone/remaining，sessions 记录结束摘要。history 可按类型、天数筛选并忽略损坏行。
+- `notify.py`：osascript 参数传递文本，避免脚本插值；每个实例按 PID + kind 冷却，默认关闭。watch 的 seen 是 `(pgid, 所有根 PID/启动时间)`，每轮与当前组取交集；失败不记 seen。
+- `panel.py`：termios raw 模式，finally 恢复终端；选择通过组身份保持，确认绑定成员快照。非 TTY 走原刷新路径。
+- `sessions.py`：配置价格覆盖内置精确型号；回退定价通过 cost_estimated 传到会话与汇总渲染。
+- `install.py`：成功复制新备份后，仅删除同目标、严格时间戳命名的旧备份；保留最新一份。
+
+测试使用合成进程快照，可注入 cwd/ports/tty/app 查询。所有信号、通知和面板清理均 mock；
+不运行安装器 main，不修改宿主配置。全量只读冒烟在独立状态目录记录预演历史。

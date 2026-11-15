@@ -117,7 +117,16 @@ def sort_sessions(sess, key):
 
 
 def cmd_panel(args):
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        from .panel import run
+        return run(args)
+    return refresh_panel(args)
+
+
+def refresh_panel(args):
     """交互式面板"""
+    from .notify import Notifier
+    notifier = Notifier()
     interval = args.refresh
     try:
         sys.stdout.write(render.HIDE_CURSOR)
@@ -126,6 +135,7 @@ def cmd_panel(args):
             node_rows = nodeheap.collect() if args.node else None
             totals = agents_mod.totals(sess)
             al = agents_mod.alerts(sess)
+            notifier.send(al)
 
             w = render.term_width()
             sys.stdout.write(render.CLEAR)
@@ -217,14 +227,14 @@ def cmd_stats(args):
     print(f"  输入 token  {sessions.format_tokens(t['input_tokens'])}")
     print(f"  输出 token  {sessions.format_tokens(t['output_tokens'])}")
     print(f"  缓存读token {sessions.format_tokens(t['cache_read_tokens'])}")
-    print(f"  总成本      {sessions.format_cost(t['cost'])}")
+    print(f"  总成本      {sessions.format_cost(t['cost'], t.get('cost_estimated', False))}")
     print(f"  内存合计    {t['mem_mb'] / 1024:.2f} GB")
     print(f"  CPU 合计    {t['cpu_pct']:.0f}%")
     if t["by_type"]:
         print()
         print(f"  {'类型':<12}{'数量':>6}{'成本':>12}{'内存':>12}")
         for k, v in sorted(t["by_type"].items()):
-            print(f"  {k:<12}{v['n']:>6}{sessions.format_cost(v['cost']):>12}"
+            print(f"  {k:<12}{v['n']:>6}{sessions.format_cost(v['cost'], v.get('cost_estimated', False)):>12}"
                   f"{v['mem'] / 1024:>10.1f}G")
     print()
     return 0
@@ -298,7 +308,7 @@ def cmd_whoami(args):
     print(f"    类型      {found['agent_type']}")
     print(f"    模型      {found.get('model') or '-'}")
     print(f"    上下文    {ctx if ctx is not None else '-'}% 剩余")
-    print(f"    成本      {sessions.format_cost(found.get('cost'))}")
+    print(f"    成本      {sessions.format_cost(found.get('cost'), found.get('cost_estimated', False))}")
     print(f"    分支      {found.get('git_branch') or '-'}")
     print(f"    目录      {found.get('cwd') or '-'}")
     print()

@@ -134,7 +134,7 @@ python3 install/install.py --uninstall
 
 1. 子进程**继承父进程的进程组**（pgid）
 2. 父进程退出后，子进程成为孤儿（ppid=1）但**保留原 pgid**
-3. `killpg(pgid)` 可一次性终止整组残留进程
+3. 清理前复核完整进程组，再逐个核对 PID + 启动时间发送信号
 
 因此按 pgid 聚合，就能把"某次 Agent 会话残留的全部进程"识别为一个可清理单元。
 
@@ -146,10 +146,11 @@ macOS 上所有桌面应用（Arc、Claude、ChatGPT、Lark、Logseq、Paseo…�
 `launchd` 拉起后 reparent 到 init 的，根进程 ppid 同样是 1，但它们完全健康。
 早期版本按 ppid 判定，差点把整屏桌面应用当垃圾清掉。
 
-真正的判据是**两条同时成立**：
+真正的判据是**所有根节点同时满足三条条件**：
 
 | 条件 | 说明 |
 |---|---|
+| 根进程父进程已退出 | ppid 为 1，或父进程不在当前快照中 |
 | 根进程自身是 shell / 开发工具 | bash、zsh、fish、node、python… |
 | 根进程的 cwd 落在工作区目录内 | 桌面应用的 cwd 是 `/`，据此可精确区分 |
 
@@ -220,10 +221,13 @@ lsof -a -d cwd -F pn -p <pid列表>
 `-F pn` 输出格式是 `p<pid>` 后跟 `n<path>`（**不能用默认表格格式解析**），
 整体耗时降到 **1.06 秒，提升约 20 倍**。
 
-### killpg 在受限环境会失败
+### 清理前复核
 
-沙箱不允许影响其它进程组，`killpg` 返回 `EPERM`。此时降级为逐进程 kill，
-且必须**先子后父**（父进程先死会留下孤儿）。
+clean、watch、hook、panel 共用清理入口。先重新扫描并核对成员身份、
+父进程、白名单、当前进程树、活跃 Agent 和监听端口；拒绝未知启动时间和其他用户的进程。
+每次发送 TERM / KILL 前再次核对 PID、启动时间和 pgid，按子先父后的顺序处理。
+内核检查与发信号并非原子操作，仍存在极短竞态窗口；本项目不声称能消除全部 PID 复用风险。
+
 
 ### 判断活跃度不用 CPU 时间
 
@@ -258,3 +262,54 @@ lsof -c claude -c node -d 0,1,2
 ## License
 
 MIT
+
+## 配置、历史与面板操作
+
+配置路径为 `~/.config/agentscope/config.json`，可用 `AGENTSCOPE_CONFIG` 覆盖。
+文件缺失使用默认配置；无效 JSON 或字段值会报错并阻止清理。示例：
+
+```json
+{
+  "workspaces": ["~/Projects", "~/Workbuddy"],
+  "protect": {
+    "comm": ["WorkBuddy", "Orca", "my-daemon"],
+    "cmdline": ["*--keep-running*"],
+    "cwd": ["*/important-service/*"]
+  },
+  "notify": {"enabled": false, "cooldown_minutes": 15},
+  "pricing": {
+    "my-model": {"input": 1, "output": 2, "cacheWrite": 1.25, "cacheRead": 0.1}
+  }
+}
+```
+
+`protect` 每个字段替换该字段的默认规则；字段之间为 OR，任一成员命中即保护整组。
+普通字符串做不区分大小写的子串匹配，包含 `* ? [` 的规则做 glob 匹配。
+命令行无法采集且启用了命令行规则时，保守地保护该进程。
+默认保护已知桌面应用，当前进程的祖先、同组进程及其后代也受到保护。
+工作区按规范化路径边界匹配，`/work` 不会匹配 `/workspace`；默认增加 `~/Workbuddy`。
+`AGENTSCOPE_WORKSPACES`（冒号分隔）优先于配置文件，保留兼容性。
+
+通知默认关闭；开启后，watch 和 panel 仅发送 `CONTEXT_LOW`、`MEM_HIGH`，以及 watch
+实际清理成功事件。每个监控实例按 PID + 告警类型限频，默认 15 分钟；重启实例后冷却重置。
+价格单位为美元 / 百万 token，覆盖项必须包含四项非负单价；非精确型号使用回退价格时，
+JSON 提供 `cost_estimated`，会话表和总成本以 `≈` 标识。内置价格是静态参考，未在线核价。
+
+终端面板：`↑↓` / `j k` 选择进程组，Enter 展开进程树，`c` 请求清理，`y` 二次确认
+（其他键取消），`s` 切换会话排序，`q` 退出。确认绑定已展示的成员身份，身份变化会拒绝清理。
+非 TTY 保持自动刷新模式，Ctrl-C 退出。
+
+```bash
+agentscope history --kills --days 7 --json
+agentscope history --sessions
+```
+
+历史位于 `~/.local/state/agentscope/kills.jsonl` 与 `sessions.jsonl`，可用
+`AGENTSCOPE_STATE_DIR` 指定隔离测试目录。新文件权限为 0600。
+清理历史包含时间、模式、成员 PID/名称/命令行/cwd、理由与结果；实际清理前先写 attempt，
+写入失败则不发送信号。dry-run 只记录预演，不发送信号，即便同时传入 `--yes`。
+历史包含本地路径和命令行，请注意其中可能出现的敏感参数。
+SessionEnd 即使没有残留也记录会话摘要；传入 transcript_path 时附带 token 和估算成本。
+安装器每个目标仅保留最新一份自身生成的时间戳备份，不删除其他命名的文件。
+
+开发验证：`python3 -m unittest discover -s tests`（标准库；信号和通知均 mock）。

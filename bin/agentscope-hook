@@ -21,12 +21,23 @@ import time
 import signal
 import subprocess
 
+# 让脚本无论从哪里调用都能找到 agentscope_lib 包
+# 优先级：① 同级仓库目录（开发态）  ② ~/.local/lib（安装态）
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _cand in (_PKG_DIR, os.path.join(os.path.expanduser("~"), ".local", "lib")):
+    if os.path.isdir(os.path.join(_cand, "agentscope_lib")) and _cand not in sys.path:
+        sys.path.insert(0, _cand)
+        break
+
+from agentscope_lib.history import append as audit
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENTSCOPE = os.path.join(HERE, "agentscope")
 
 
 def log(msg):
     sys.stderr.write(f"[agentscope-hook] {msg}\n")
+    sys.stderr.flush()
 
 
 def read_stdin_json():
@@ -96,19 +107,8 @@ def ancestor_pgids():
 
 def ppid_of(pid):
     """取任意进程的父 PID（libproc 方式，ps 在沙箱内不可用）"""
-    import ctypes
-    libproc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-    libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-                                      ctypes.c_void_p, ctypes.c_int]
-    libproc.proc_pidinfo.restype = ctypes.c_int
-    raw = ctypes.create_string_buffer(1024)
-    r = libproc.proc_pidinfo(pid, 3, 0, raw, 1024)
-    if r <= 0:
-        return 0
-    d = raw.raw[:r]
-    if len(d) < 20:
-        return 0
-    return int.from_bytes(d[16:20], "little", signed=True)
+    from agentscope_lib.procstat import proc_parent
+    return proc_parent(pid)
 
 
 def find_session_groups(hook_input):
@@ -172,66 +172,9 @@ def _filter_cleanable(groups):
 
 
 def cleanup(groups):
-    """终止指定进程组"""
-    cleaned = 0
-    for g in groups:
-        pgid = g["pgid"]
-        members = g.get("members", [])
-        # 二次校验：组内若出现 Agent 本体，说明会话还活着 —— 放弃清理
-        live_agent = [p for p in members if _is_agent_main(p)]
-        if live_agent:
-            log(f"跳过 pgid {pgid}：检测到活跃 Agent 进程 {live_agent}")
-            continue
-        # 优先 killpg；受限环境下会 EPERM，此时降级为逐进程终止
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            for pid in reversed(members):   # 先子后父
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-        # 等一会，若还有残留则升级
-        time.sleep(0.8)
-        try:
-            os.killpg(pgid, 0)
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            for pid in reversed(members):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
-        cleaned += len(members)
-        log(f"已清理 pgid {pgid} ({len(members)} 进程) @ {g.get('cwd','')}")
-    return cleaned
-
-
-_AGENT_MAIN = ("claude", "codex", "zcode-cli", "kimi-code", "cursor-agent",
-               "opencode", "aider", "gemini")
-
-
-def _is_agent_main(pid):
-    """判断 PID 是否为 Agent 本体进程"""
-    try:
-        import ctypes
-        libproc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-        libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
-                                          ctypes.c_void_p, ctypes.c_int]
-        libproc.proc_pidinfo.restype = ctypes.c_int
-        raw = ctypes.create_string_buffer(1024)
-        r = libproc.proc_pidinfo(pid, 3, 0, raw, 1024)
-        if r <= 0:
-            return False
-        d = raw.raw[:r]
-        if len(d) < 96:
-            return False
-        comm = d[48:64].split(b"\0")[0].decode(errors="replace").lower()
-        name = d[64:96].split(b"\0")[0].decode(errors="replace").lower()
-        hay = comm + " " + name
-        return any(m in hay for m in _AGENT_MAIN)
-    except Exception:
-        return False
+    from agentscope_lib.cleanup import kill_group
+    return sum(len(g['members']) for g in groups
+               if kill_group(g['pgid'], mode='hook', expected=g))
 
 
 def main():
@@ -246,14 +189,22 @@ def main():
         log(f"会话结束 (reason={reason or 'n/a'})")
 
         groups = find_session_groups(hook_input)
-        if not groups:
-            log("未发现本次会话的残留进程组，无需清理。")
-            return 0
-
-        total = sum(len(g.get("members", [])) for g in groups)
-        log(f"发现 {len(groups)} 个残留进程组，共 {total} 个进程")
-        n = cleanup(groups)
-        log(f"清理完成，回收 {n} 个进程。")
+        summary = {'session_id': hook_input.get('session_id') or os.environ.get('CLAUDE_SESSION_ID'),
+                   'cwd': hook_input.get('cwd'), 'reason': reason, 'action': action,
+                   'candidate_groups': [g['pgid'] for g in groups], 'cleaned_processes': 0}
+        transcript = hook_input.get('transcript_path')
+        if transcript and os.path.isfile(transcript):
+            from agentscope_lib import sessions
+            data = sessions.parse_claude_session(transcript)
+            for key in ('model', 'input_tokens', 'output_tokens', 'cache_create_tokens', 'cache_read_tokens'):
+                summary[key] = data.get(key)
+            summary['cost'] = sessions.calculate_cost(data.get('model'), data.get('input_tokens'), data.get('output_tokens'), data.get('cache_create_tokens'), data.get('cache_read_tokens'))
+            summary['cost_estimated'] = sessions.cost_estimated(data.get('model'))
+        try:
+            summary['cleaned_processes'] = cleanup(groups) if groups else 0
+            log(f"清理完成，回收 {summary['cleaned_processes']} 个进程。")
+        finally:
+            audit('sessions', summary)
     elif action == "scan":
         groups = find_session_groups(hook_input)
         print(json.dumps(groups, ensure_ascii=False, indent=2))

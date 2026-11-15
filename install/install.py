@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import datetime
 
 HOME = os.path.expanduser("~")
 BIN_DIR = os.path.join(HOME, ".local", "bin")
@@ -50,8 +51,14 @@ def run(cmd, **kw):
 def backup(path):
     if not os.path.exists(path):
         return None
-    b = f"{path}.bak.agentscope.{time.strftime('%Y%m%d-%H%M%S')}"
+    b = f"{path}.bak.agentscope.{datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
     shutil.copy2(path, b)
+    directory = os.path.dirname(path) or '.'
+    pattern = re.compile(re.escape(os.path.basename(path)) + r'\.bak\.agentscope\.\d{8}-\d{6}(?:-\d{6})?$')
+    for name in os.listdir(directory):
+        old = os.path.join(directory, name)
+        if pattern.fullmatch(name) and old != b and os.path.isfile(old) and not os.path.islink(old):
+            os.unlink(old)
     return b
 
 

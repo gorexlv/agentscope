@@ -83,42 +83,44 @@ DEFAULT_CONTEXT_LIMIT = 200_000
 
 def pricing_for(model, agent_type=None):
     """按模型名取价，未命中则按关键词/类型回退"""
+    from .config import load_config
+    table = dict(MODEL_PRICING, **load_config()['pricing'])
     if not model:
         return None
-    if model in MODEL_PRICING:
-        return MODEL_PRICING[model]
+    if model in table:
+        return table[model]
     m = model.lower()
     if "opus" in m:
-        return MODEL_PRICING["claude-opus-5-5"]
+        return table["claude-opus-5-5"]
     if "haiku" in m:
-        return MODEL_PRICING["claude-haiku-4-5"]
+        return table["claude-haiku-4-5"]
     if "sonnet" in m:
-        return MODEL_PRICING["claude-sonnet-5"]
+        return table["claude-sonnet-5"]
     if "gpt-4.1-nano" in m:
-        return MODEL_PRICING["gpt-4.1-nano"]
+        return table["gpt-4.1-nano"]
     if "gpt-4.1-mini" in m:
-        return MODEL_PRICING["gpt-4.1-mini"]
+        return table["gpt-4.1-mini"]
     if "gpt-4.1" in m or "gpt-5" in m:
-        return MODEL_PRICING["gpt-5"]
+        return table["gpt-5"]
     if "o3" in m:
-        return MODEL_PRICING["o3"]
+        return table["o3"]
     if "o4-mini" in m:
-        return MODEL_PRICING["o4-mini"]
+        return table["o4-mini"]
     if "codex-mini" in m:
-        return MODEL_PRICING["codex-mini-latest"]
+        return table["codex-mini-latest"]
     if any(k in m for k in ("ollama", "qwen", "llama")):
-        return MODEL_PRICING["ollama"]
+        return table["ollama"]
     if "swe-1" in m and "fast" in m:
-        return MODEL_PRICING["swe-1-6-fast"]
+        return table["swe-1-6-fast"]
     if "swe-1" in m or m.startswith("swe-"):
-        return MODEL_PRICING["swe-1-6"]
+        return table["swe-1-6"]
     if agent_type == "codex":
-        return MODEL_PRICING["gpt-5"]
+        return table["gpt-5"]
     if agent_type == "opencode":
-        return MODEL_PRICING["claude-sonnet-5"]
+        return table["claude-sonnet-5"]
     if agent_type == "devin":
-        return MODEL_PRICING["swe-1-6"]
-    return MODEL_PRICING["claude-sonnet-5"]
+        return table["swe-1-6"]
+    return table["claude-sonnet-5"]
 
 
 def calculate_cost(model, input_tokens, output_tokens,
@@ -137,12 +139,18 @@ def calculate_cost(model, input_tokens, output_tokens,
     )
 
 
-def format_cost(cost):
+def cost_estimated(model):
+    from .config import load_config
+    return bool(model) and model not in MODEL_PRICING and model not in load_config()['pricing']
+
+
+def format_cost(cost, estimated=False):
     if cost is None:
         return "--"
+    prefix = "≈" if estimated else ""
     if cost < 0.01:
-        return "<$0.01"
-    return f"${cost:.2f}"
+        return prefix + "<$0.01"
+    return prefix + f"${cost:.2f}"
 
 
 def format_tokens(n):
