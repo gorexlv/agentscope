@@ -6,6 +6,7 @@ import os
 import stat
 import subprocess
 import time
+import sys
 
 
 def run(args):
@@ -22,7 +23,7 @@ def run(args):
     if args.dry_run:
         print(json.dumps({'command':command,'heavy':args.heavy,'max_load':threshold,'load':os.getloadavg()[0],'execute':False}))
         return 0
-    if not args.heavy:
+    if not args.heavy or os.environ.get('AGENTSCOPE_HEAVY_HELD') == '1':
         return subprocess.run(command).returncode
     path = os.environ.get('AGENTSCOPE_HEAVY_LOCK', '/tmp/agentscope-heavy.lock')
     fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o666)
@@ -30,6 +31,7 @@ def run(args):
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError('heavy lock must be a regular file')
         started = time.monotonic()
+        next_notice = started
         while True:
             locked = False
             try:
@@ -37,8 +39,13 @@ def run(args):
                 locked = True
             except BlockingIOError:
                 pass
-            if locked and os.getloadavg()[0] <= threshold:
-                return subprocess.run(command).returncode
+            load = os.getloadavg()[0]
+            if locked and load <= threshold:
+                env = dict(os.environ, AGENTSCOPE_HEAVY_HELD='1')
+                return subprocess.run(command, env=env, pass_fds=(fd,)).returncode
+            if time.monotonic() >= next_notice:
+                print(f'agentscope: waiting for heavy slot; load={load:.2f}, threshold={threshold}, lock_available={locked}', file=sys.stderr, flush=True)
+                next_notice = time.monotonic()+15
             if locked:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             if args.wait_timeout and time.monotonic()-started >= args.wait_timeout:

@@ -205,3 +205,8 @@ pbi_comm   @48  (16 bytes)   pbi_name @64 (32 bytes)
 
 限制：MCP 命名模式和会话状态是启发式；同 cwd 不能证明具体会话归属；Orca 祖先已退出后无法追溯历史归属。
 磁盘目录 inode/进程检查与 rmtree 非原子，指标 RSS 和原 footprint 口径不同，额度和登录状态均不能替代在线验证。
+
+复审 r2：disk 的 deletion_evidence 在展示及删除前重复验证 `.git` 和同级语言/构建项目标记，
+工作区路径与目录名本身不再构成删除授权。heavy 默认 300 秒排队预算、15 秒状态提示，
+用 pass_fds 将 flock fd 交给子进程，嵌套调用用 AGENTSCOPE_HEAVY_HELD 避免重复排队。
+真实测试覆盖包装进程退出后子进程仍持锁，子进程退出后释放；轮询不提供 FIFO 保证。

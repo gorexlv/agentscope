@@ -465,6 +465,8 @@ def cmd_scan(args):
         orphan_n = sum(1 for g in units if cleanable(g, info))
         live_n = sum(1 for g in units if not g["orphan"])
         out.append(f"可清理孤儿组: {orphan_n}   存活组: {live_n}")
+        if any(g.get("ports_unknown") for g in units):
+            out.append("端口信息未知，相关组将跳过清理。")
         out.append(format_units(units, info, limit=args.limit))
         return "\n".join(out)
 
@@ -534,6 +536,7 @@ def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
     """Signal only confirmed identities; audit errors never change cleanup results."""
     outcome = outcome if outcome is not None else {}
     cfg = load_config()
+    sent = set()
     record = {'mode': mode, 'pgid': pgid, 'members': [], 'reason': ''}
     def finish(result, reason=None):
         outcome['result'] = result
@@ -608,7 +611,7 @@ def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
             return finish('remaining', 'new or remaining group members')
         return finish('cleaned' if sent else 'gone')
     except (TimeoutError, subprocess.TimeoutExpired):
-        return finish('skipped', 'deadline exceeded')
+        return finish('remaining' if sent else 'skipped', 'deadline exceeded')
 
 
 def cmd_clean(args):
@@ -617,6 +620,8 @@ def cmd_clean(args):
         audit("kills", {"mode": "clean", "result": "skipped", "reason": "invalid config", "pgid": None, "members": []})
         return 0
     info, units = analyze(cfg=cfg)
+    if any(g.get("ports_unknown") for g in units):
+        print("端口信息未知，已跳过相关组清理。")
     targets = []
     skipped_live = []
     for g in units:

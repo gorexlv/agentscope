@@ -31,6 +31,15 @@ def cmd_disk(args):
     return output(disk.collect(),args.json)
 
 
+
+def cmd_timeline(args):
+    try:
+        return output(metrics.timeline(args.since),args.json)
+    except ValueError:
+        import sys
+        print('Invalid --since: use an ISO timestamp or duration such as 30m/2h/7d',file=sys.stderr)
+        return 2
+
 def register(sub):
     p = sub.add_parser('mcp',help='MCP instances grouped by server name')
     p.add_argument('--json',action='store_true')
@@ -50,11 +59,11 @@ def register(sub):
     p = sub.add_parser('timeline',help='Read rotated watch metrics')
     p.add_argument('--since',default='1h',help='ISO timestamp or duration: 30m/2h/7d')
     p.add_argument('--json',action='store_true')
-    p.set_defaults(func=lambda args:output(metrics.timeline(args.since),args.json))
+    p.set_defaults(func=cmd_timeline)
     p = sub.add_parser('run',help='Run a command, optionally queue behind a host-wide heavy-task lock')
     p.add_argument('--heavy',action='store_true')
     p.add_argument('--max-load',type=float)
-    p.add_argument('--wait-timeout',type=float,default=0)
+    p.add_argument('--wait-timeout',type=float,default=300)
     p.add_argument('--dry-run',action='store_true')
     p.add_argument('command',nargs=argparse.REMAINDER)
     p.set_defaults(func=heavy.run)

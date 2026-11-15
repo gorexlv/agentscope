@@ -76,4 +76,4 @@ def collect(home=None):
         notify['wrapper'] = 'unreadable'
     return {'offline':True,'credentials':[credential(home/'.codex/auth.json','codex'), credential(home/'.claude/.credentials.json','claude')],
             'quota':quota(home),'hooks':hook,'notify':notify,
-            'note':'Presence and local quota history only; no login or live quota verification performed'}
+            'note':'Presence and local quota history only; no login or live quota verification performed. Claude Code may use macOS Keychain; a missing credentials file does not imply logged out.'}

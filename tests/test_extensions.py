@@ -83,7 +83,9 @@ class ExtensionTests(unittest.TestCase):
             with patch.object(heavy.os,'getloadavg',return_value=(0,0,0)), patch.object(heavy.time,'sleep',side_effect=release) as wait, patch.object(heavy.subprocess,'run',return_value=types.SimpleNamespace(returncode=7)) as execute:
                 self.assertEqual(heavy.run(args),7)
                 wait.assert_called_once()
-                execute.assert_called_once_with(['test-command'])
+                self.assertEqual(execute.call_args.args[0],['test-command'])
+                self.assertEqual(execute.call_args.kwargs['env']['AGENTSCOPE_HEAVY_HELD'],'1')
+                self.assertTrue(execute.call_args.kwargs['pass_fds'])
         finally:
             os.close(fd)
 
@@ -113,6 +115,7 @@ class ExtensionTests(unittest.TestCase):
         repo=self.root/'repo'
         target=repo/'node_modules'
         target.mkdir(parents=True)
+        (repo/'package.json').write_text('{}')
         (target/'data').write_bytes(b'x'*8192)
         meta=repo/'.git/worktrees/old'
         meta.mkdir(parents=True)

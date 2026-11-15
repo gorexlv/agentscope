@@ -378,3 +378,14 @@ watch 每轮写 metrics.jsonl：负载、系统 free/active 内存、各 Agent P
 采样复用当前快照，不调用重量级 agents.collect；通知关闭时也会采样。
 日志达到 1 MiB 后轮转，保留三份归档；timeline 同时读取当前文件和归档，忽略损坏行。
 指标采样或落盘失败只警告，不中断清理。测试覆盖 13–21 各项，真实信号仍只限测试自身创建的进程。
+
+磁盘删除进一步要求：目标位于有 `.git` 标记的 worktree 中，同级具有匹配的项目文件。
+node_modules/dist/.next/build 要求 package.json，.venv 要求 pyproject.toml、requirements*.txt 或 setup.py，
+target 要求 Cargo.toml 或 pom.xml，build 也接受 build.gradle/build.gradle.kts。
+不满足条件的同名目录仅显示占用，deletable=false，不提供删除建议，也不能通过 --yes 绕过。
+
+重任务默认最多等待 300 秒，每 15 秒打印排队状态；可显式用 --wait-timeout 0 选择不限时。
+持锁子命令会继承锁 fd 和 AGENTSCOPE_HEAVY_HELD=1，嵌套调用直接执行，避免自锁。
+包装进程被终止后，子命令持有的 fd 会让锁保持到子命令退出；若子命令主动关闭所有非标准 fd，这种保证不再成立。
+排队是轮询竞争，不保证 FIFO；子命令退出或异常时 fd 关闭并释放锁，不删除锁文件。
+Claude Code 也可能把凭据存放在 macOS Keychain，doctor 的 missing 只代表未找到本地凭据文件，不代表未登录。

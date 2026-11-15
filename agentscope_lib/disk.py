@@ -10,6 +10,20 @@ from .ownership import worktree_for
 ARTIFACTS = {'node_modules', '.venv', 'dist', 'build', '.next', 'target'}
 
 
+
+def deletion_evidence(path, roots):
+    parent = Path(path).parent
+    worktree = worktree_for(str(parent), roots)
+    if not worktree or not (Path(worktree)/'.git').exists():
+        return None
+    name = Path(path).name
+    patterns = {'node_modules':['package.json'], 'dist':['package.json'], '.next':['package.json'],
+                'build':['package.json','build.gradle','build.gradle.kts'],
+                '.venv':['pyproject.toml','requirements*.txt','setup.py'], 'target':['Cargo.toml','pom.xml']}
+    if not any(p.is_file() and not p.is_symlink() for pattern in patterns.get(name,[]) for p in parent.glob(pattern)):
+        return None
+    return worktree
+
 def size_of(path, deadline):
     total, complete, seen = 0, True, set()
     errors = []
@@ -51,8 +65,9 @@ def collect(roots=None, budget=8):
                         continue
                     visited.add(path)
                     size, complete = size_of(path,deadline)
+                    evidence = deletion_evidence(path,roots)
                     rows.append({'path':path,'worktree':worktree_for(root,roots),'kind':name,'bytes':size,'size_complete':complete,
-                                 'abandoned':False,'suggestion':'Review disk --clean PATH --yes (requires no active processes)'})
+                                 'abandoned':False,'deletable':bool(evidence),'suggestion':'Review disk --clean PATH --yes (requires no active processes)' if evidence else None})
             meta = Path(root)/'.git/worktrees'
             if meta.is_dir():
                 try:
@@ -97,6 +112,9 @@ def clean(path, yes=False):
         return finish('skipped','invalid config or non-artifact target')
     if path != os.path.realpath(path) or not os.path.isdir(path) or path in cfg['workspaces']:
         return finish('skipped','symlink, missing target, or workspace root')
+    evidence = deletion_evidence(path,cfg['workspaces'])
+    if not evidence:
+        return finish('skipped','git worktree and matching project marker required')
     before = os.stat(path)
     info, groups = cleanup.analyze(cfg=cfg)
     worktree = worktree_for(os.path.dirname(path),cfg["workspaces"])
@@ -109,6 +127,8 @@ def clean(path, yes=False):
                                 for g in groups if set(g['members']) & related]
     if related:
         return finish('skipped','worktree has active processes; stop them explicitly first')
+    if deletion_evidence(path,cfg['workspaces']) != evidence:
+        return finish('skipped','project evidence changed during validation')
     current = os.stat(path)
     if (before.st_dev,before.st_ino) != (current.st_dev,current.st_ino) or os.path.realpath(path) != path:
         return finish('skipped','target changed during validation')
