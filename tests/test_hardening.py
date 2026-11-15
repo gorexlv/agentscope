@@ -45,7 +45,8 @@ class HardeningTests(unittest.TestCase):
     def test_parent_absent_and_init_are_orphans(self):
         self.assertTrue(self.classify()['orphan'])
         self.info[100]['ppid'] = 99
-        self.assertTrue(self.classify()['orphan'])
+        with patch.object(cleanup.os, "kill", side_effect=ProcessLookupError):
+            self.assertTrue(self.classify()['orphan'])
 
     def test_every_root_must_be_orphan_workspace_tool(self):
         self.info[101]['ppid'] = 99
@@ -100,7 +101,7 @@ class HardeningTests(unittest.TestCase):
         for bad in ['{', '[]', '{"protect":{"cwd": "x"}}', '{"notify":{"cooldown_minutes": -1}}', '{"pricing":{"x":{"input":1}}}']:
             p.write_text(bad)
             with self.assertRaises(ValueError):
-                config.load_config()
+                config.load_config(strict=True)
 
     def test_pricing_exact_override_and_fallback(self):
         self.assertFalse(sessions.cost_estimated('gpt-5'))
@@ -139,28 +140,29 @@ class HardeningTests(unittest.TestCase):
 
     def test_kill_rejects_protected_and_changed_members(self):
         g = self.classify()
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value={101}), patch.object(cleanup.os, 'kill') as kill:
+        with patch.object(cleanup, 'revalidate_group', return_value=(self.info, g)), patch.object(cleanup, 'my_protected_pids', return_value={101}), patch.object(cleanup.os, 'kill') as kill:
             self.assertFalse(cleanup.kill_group(100))
             kill.assert_not_called()
-        expected = dict(g, identities={'100': 1})
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup.os, 'kill') as kill:
+        expected = dict(g, root_starts=[(100, 1)])
+        with patch.object(cleanup, 'revalidate_group', return_value=(self.info, g)), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup.os, 'kill') as kill:
             self.assertFalse(cleanup.kill_group(100, expected=expected))
             self.assertTrue(cleanup.kill_group(100, dry_run=True))
             kill.assert_not_called()
 
     def test_kill_audit_and_no_pid_reuse(self):
         g = self.classify()
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'proc_pgid', return_value=100), patch.object(cleanup, 'proc_bsdinfo', return_value=process(100, 1, start=999)), patch.object(cleanup.os, 'kill') as kill:
-            self.assertFalse(cleanup.kill_group(100, timeout=0))
+        with patch.object(cleanup, 'revalidate_group', return_value=(self.info, g)), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'scan_processes', return_value={}), patch.object(cleanup, 'proc_pgid', return_value=100), patch.object(cleanup, 'proc_bsdinfo', return_value=process(100, 1, start=999)), patch.object(cleanup.os, 'kill') as kill:
+            self.assertTrue(cleanup.kill_group(100, timeout=0))
             kill.assert_not_called()
         self.assertEqual([r['result'] for r in history.read(['kills'])], ['attempt', 'gone'])
 
     def test_yes_dry_run_never_signals(self):
         g = self.classify()
         args = types.SimpleNamespace(yes=True, dry_run=True, keep_ports=True)
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'kill_group') as kill, contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'kill_group') as kill, contextlib.redirect_stdout(io.StringIO()):
             cleanup.cmd_clean(args)
-        self.assertTrue(kill.call_args.kwargs['dry_run'])
+        kill.assert_not_called()
+        self.assertEqual(history.read(['kills'])[0]['result'], 'dry-run')
 
     def test_panel_tree(self):
         lines = panel.tree_lines(self.classify(), self.info)
@@ -168,23 +170,20 @@ class HardeningTests(unittest.TestCase):
         self.assertTrue(lines[1].startswith('    '))
 
     def test_panel_confirmation_and_restore(self):
-        g = self.classify()
-        fake_stdin = Mock()
-        fake_stdin.fileno.return_value = 0
+        g = dict(self.classify(), can_clean=True)
         args = types.SimpleNamespace(refresh=3, context_limit=200000, node=False)
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(panel.sys, 'stdin', fake_stdin))
+            stack.enter_context(patch.object(panel.sys, 'stdin', Mock()))
             stack.enter_context(patch.object(panel.sys, 'stdout', io.StringIO()))
             stack.enter_context(patch.object(panel.termios, 'tcgetattr', return_value=['saved']))
             restore = stack.enter_context(patch.object(panel.termios, 'tcsetattr'))
             stack.enter_context(patch.object(panel.tty, 'setraw'))
             stack.enter_context(patch.object(panel, 'read_key', side_effect=['c', 'n', 's', 'c', 'y', 'q']))
-            stack.enter_context(patch.object(panel.cleanup, 'analyze', return_value=(self.info, [g])))
-            stack.enter_context(patch.object(panel.cleanup, 'cleanable', return_value=True))
-            kill = stack.enter_context(patch.object(panel.cleanup, 'kill_group', return_value=True))
-            stack.enter_context(patch.object(panel.agents, 'collect', return_value=[]))
+            worker = stack.enter_context(patch.object(panel, 'PanelWorker')).return_value
+            worker.poll.side_effect = [{'info': self.info, 'groups': [g], 'sess': [], 'nodes': None}] + [None]*5
             self.assertEqual(panel.run(args), 0)
-            kill.assert_called_once_with(100, mode='panel', expected=g)
+            worker.request.assert_called_once_with(g)
+            worker.close.assert_called_once()
             restore.assert_called_once()
 
     def test_hook_records_empty_session_and_uses_shared_cleanup(self):
@@ -196,16 +195,19 @@ class HardeningTests(unittest.TestCase):
             self.assertEqual(hook.main(), 0)
         self.assertEqual(history.read(['sessions'])[0]['cleaned_processes'], 0)
         g = self.classify()
-        with patch.object(cleanup, 'kill_group', return_value=True) as kill:
+        def mark_cleaned(*args, **kw):
+            kw['outcome']['result'] = 'cleaned'
+            return True
+        with patch.object(cleanup, 'kill_group', side_effect=mark_cleaned) as kill:
             self.assertEqual(hook.cleanup([g]), 2)
-            kill.assert_called_once_with(100, mode='hook', expected=g)
+            self.assertEqual(kill.call_args.kwargs['mode'], 'hook')
 
     def test_mocked_signals_children_first_and_audit(self):
         g = self.classify()
         alive = dict(self.info)
         def signal_pid(pid, sig):
             alive.pop(pid, None)
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'proc_pgid', return_value=100), patch.object(cleanup, 'proc_bsdinfo', side_effect=lambda p: alive.get(p)), patch.object(cleanup.os, 'kill', side_effect=signal_pid) as kill:
+        with patch.object(cleanup, 'revalidate_group', return_value=(self.info, g)), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'scan_processes', return_value={}), patch.object(cleanup, 'proc_pgid', return_value=100), patch.object(cleanup, 'proc_bsdinfo', side_effect=lambda p: alive.get(p)), patch.object(cleanup, 'parent_exited', return_value=True), patch.object(cleanup.os, 'kill', side_effect=signal_pid) as kill:
             self.assertTrue(cleanup.kill_group(100, timeout=0))
             self.assertEqual([c.args[0] for c in kill.call_args_list], [101, 100])
         self.assertEqual([r['result'] for r in history.read(['kills'])], ['attempt', 'cleaned'])
@@ -226,12 +228,12 @@ class HardeningTests(unittest.TestCase):
             self.assertTrue(all(c.kwargs['dry_run'] for c in kill.call_args_list))
             self.assertTrue(all(c.args[0] == [] for c in notifier.return_value.send.call_args_list))
 
-    def test_audit_failure_blocks_signals(self):
+    def test_audit_failure_does_not_block_signals(self):
         g = self.classify()
-        with patch.object(cleanup, 'analyze', return_value=(self.info, [g])), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(cleanup, 'audit', side_effect=OSError('disk full')), patch.object(cleanup.os, 'kill') as kill:
-            with self.assertRaises(OSError):
-                cleanup.kill_group(100)
-            kill.assert_not_called()
+        alive = dict(self.info)
+        with patch.object(cleanup, 'revalidate_group', return_value=(self.info, g)), patch.object(cleanup, 'my_protected_pids', return_value=set()), patch.object(cleanup, 'proc_cwd', return_value='/work'), patch.object(history.os, 'makedirs', side_effect=OSError('disk full')), patch.object(cleanup, 'scan_processes', return_value={}), patch.object(cleanup, 'proc_pgid', return_value=100), patch.object(cleanup, 'proc_bsdinfo', side_effect=lambda p: alive.get(p)), patch.object(cleanup, 'parent_exited', return_value=True), patch.object(cleanup.os, 'kill', side_effect=lambda p, sig: alive.pop(p, None)) as kill:
+            self.assertTrue(cleanup.kill_group(100, timeout=0))
+            self.assertEqual(kill.call_count, 2)
 
     def test_missing_cmdline_is_protected(self):
         b = dict(self.info[100])

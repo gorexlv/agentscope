@@ -3,23 +3,26 @@ import fnmatch
 import json
 import math
 import os
+import copy
+import sys
 
 DEFAULT_PROTECT = ['WorkBuddy', 'Logseq', 'ChatGPT', 'Claude.app', 'LarkSuite',
                    'Orca', 'Paseo', 'Raycast', 'OrbStack', 'Terminal', 'iTerm']
 
 
-def load_config(path=None):
+def _parse_config(path, data=None):
     path = path or os.environ.get('AGENTSCOPE_CONFIG', '~/.config/agentscope/config.json')
     cfg = {'workspaces': [os.path.expanduser('~/' + p) for p in
            ('Workspace', 'Worksapce', 'Workbuddy', 'orca/workspaces', '.codex/worktrees',
             '.claude', 'Desktop', 'Documents', 'Projects')],
-           'protect': {'comm': list(DEFAULT_PROTECT), 'cmdline': list(DEFAULT_PROTECT), 'cwd': []},
+           'protect': {'comm': [name + '*' for name in DEFAULT_PROTECT], 'cmdline': ['*/' + name.removesuffix('.app') + '.app/*' for name in DEFAULT_PROTECT], 'cwd': []},
            'notify': {'enabled': False, 'cooldown_minutes': 15}, 'pricing': {}}
-    try:
-        with open(os.path.expanduser(path), encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        data = {}
+    if data is None:
+        try:
+            with open(os.path.expanduser(path), encoding='utf-8') as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
     if not isinstance(data, dict):
         raise ValueError('config must be an object')
     for k in ('workspaces',):
@@ -46,6 +49,34 @@ def load_config(path=None):
         cfg['workspaces'] = [p for p in env.split(os.pathsep) if p]
     cfg['workspaces'] = [os.path.realpath(os.path.expanduser(p)) for p in cfg['workspaces']]
     return cfg
+
+
+_cache_key = None
+_cache_value = None
+
+
+def load_config(path=None, strict=False):
+    """Cache one parsed file revision; readers fall back, cleaners inspect valid."""
+    global _cache_key, _cache_value
+    path = os.path.expanduser(path or os.environ.get('AGENTSCOPE_CONFIG', '~/.config/agentscope/config.json'))
+    try:
+        st = os.stat(path)
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+    except OSError as error:
+        stamp = (type(error).__name__, str(error))
+    key = (path, stamp, os.environ.get('AGENTSCOPE_WORKSPACES'))
+    if key != _cache_key:
+        try:
+            value = _parse_config(path)
+            value['valid'] = True
+        except (OSError, ValueError, TypeError) as error:
+            value = _parse_config(path, data={})
+            value.update(valid=False, error=str(error))
+            print(f'agentscope: invalid config; display defaults, cleanup disabled: {error}', file=sys.stderr, flush=True)
+        _cache_key, _cache_value = key, value
+    if strict and not _cache_value['valid']:
+        raise ValueError(_cache_value['error'])
+    return copy.deepcopy(_cache_value)
 
 
 def protected(record, cwd, cfg):

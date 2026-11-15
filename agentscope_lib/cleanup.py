@@ -39,6 +39,7 @@ VERSION = "1.1.0"
 from agentscope_lib.procstat import list_pids, proc_bsdinfo, scan_processes, proc_pgid, load_cwds, load_listening_ports
 from agentscope_lib.config import load_config, protected as config_protected, within
 from agentscope_lib.history import append as audit
+from agentscope_lib.lifecycle import remaining
 from agentscope_lib.notify import Notifier, group_key, expire_seen
 import functools
 import builtins
@@ -80,7 +81,7 @@ EXCLUDE_COMM = (
 _cwd_cache = {}
 
 
-def load_cwds_batch(pids):
+def load_cwds_batch(pids, deadline=None):
     """一次性获取所有进程的 cwd —— 比逐个调用 lsof 快 60 倍以上。
 
     逐进程调 lsof 在 500+ 进程时需要 24 秒，hook 有超时限制，必须批量。
@@ -88,7 +89,7 @@ def load_cwds_batch(pids):
     """
     global _cwd_cache
     _cwd_cache = {p: "" for p in pids}
-    _cwd_cache.update(load_cwds(pids))
+    _cwd_cache.update(load_cwds(pids, deadline=deadline))
     return _cwd_cache
 
 
@@ -132,7 +133,7 @@ def app_of(pid):
 _app_cache = None
 
 
-def load_apps_batch(pids):
+def load_apps_batch(pids, deadline=None):
     """批量获取所有进程的宿主 .app —— 一次 lsof 调用"""
     global _app_cache
     _app_cache = {}
@@ -140,7 +141,7 @@ def load_apps_batch(pids):
         return _app_cache
     try:
         r = subprocess.run(["lsof", "-p", ",".join(str(p) for p in pids)],
-                           capture_output=True, text=True, timeout=30).stdout
+                           capture_output=True, text=True, timeout=remaining(deadline, 30)).stdout
         for line in r.splitlines()[1:]:
             if ".app/Contents/" not in line:
                 continue
@@ -168,10 +169,10 @@ def build_groups(info):
 _ports_cache = None
 
 
-def load_ports_batch():
+def load_ports_batch(deadline=None):
     """批量获取所有监听端口 —— 一次 lsof 调用搞定"""
     global _ports_cache
-    _ports_cache = load_listening_ports()
+    _ports_cache = load_listening_ports(deadline=deadline)
     return _ports_cache
 
 
@@ -230,11 +231,26 @@ def in_workspace(path):
     return within(path, load_config()['workspaces'])
 
 
-def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_query=None, app_query=None, cfg=None):
+def parent_exited(ppid, info):
+    if ppid == 1:
+        return True
+    if ppid <= 0 or ppid in info:
+        return False
+    try:
+        os.kill(ppid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_query=None, app_query=None, cfg=None, parent_query=None):
     """给一个进程组分类，返回结构化描述"""
     cfg = cfg or load_config()
+    parent_query = parent_query or (lambda ppid: parent_exited(ppid, info))
     cwd_query = cwd_query or proc_cwd
-    ports_query = ports_query or (lambda: _ports_cache or {})
+    ports_query = ports_query or (lambda: _ports_cache)
     tty_query = tty_query or tty_pids
     app_query = app_query or app_of
     names = [info[p]["comm"] for p in members]
@@ -265,7 +281,7 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
 
     # 残留 = 根在 workspace 里，且根是 shell/开发工具（非桌面应用）
     orphan = (root_in_ws and root_is_shell and not root_is_desktop
-              and all(info[p]["ppid"] == 1 or info[p]["ppid"] not in info for p in roots))
+              and all(parent_query(info[p]["ppid"]) for p in roots))
 
     protected = any(config_protected(info[p], cwd_query(p), cfg) or
                     any(h in (info[p]['comm'] + ' ' + info[p]['name']).lower() for h in DESKTOP_HOSTS) or
@@ -326,6 +342,8 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
         "cwd": top_cwd,
         "cwd_concentration": f"{top_n}/{len(members)}",
         "ports": sorted(set(ports)),
+        "ports_unknown": port_map is None,
+        "config_valid": cfg.get("valid", True),
         "names": names[:12],
         "root": roots,
         "root_starts": [(p, info[p].get('start_time', 0)) for p in sorted(roots)],
@@ -334,21 +352,23 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
     }
 
 
-def analyze(info=None):
+def analyze(info=None, cfg=None, deadline=None):
+    cfg = cfg or load_config()
     global _tty_cache
     _tty_cache = None
-    info = scan_processes() if info is None else info
+    info = scan_processes(deadline=deadline) if info is None else info
     # 批量预取 cwd 与端口 —— 这是性能关键点
-    load_cwds_batch(list(info.keys()))
-    load_ports_batch()
-    load_apps_batch(list(info))
+    load_cwds_batch(list(info.keys()), deadline=deadline)
+    load_ports_batch(deadline=deadline)
+    load_apps_batch(list(info), deadline=deadline)
+    remaining(deadline, 1)
     groups = build_groups(info)
 
     units = []
     for pgid, members in groups.items():
         if len(members) < 2:
             continue
-        g = classify_group(pgid, members, info)
+        g = classify_group(pgid, members, info, cfg=cfg, tty_query=lambda: set())
         # 孤儿组一律纳入（父进程已死 = 明确残留信号）
         # 存活组仅在明确像 Agent 会话时纳入
         if g["orphan"] or g["agent_like"]:
@@ -358,16 +378,16 @@ def analyze(info=None):
     return info, units
 
 
-def my_protected_pids(info):
+def my_protected_pids(info, cfg=None):
     """当前会话所在的进程树 —— 绝不能动"""
-    cfg = load_config()
+    cfg = cfg or load_config()
     prot = {os.getpid()}
     p = os.getpid()
     while p in info and info[p]['ppid'] > 1 and info[p]['ppid'] not in prot:
         p = info[p]['ppid']
         prot.add(p)
     groups = {info[p]['pgid'] for p in prot if p in info}
-    prot.update(p for p, b in info.items() if b['pgid'] in groups or config_protected(b, proc_cwd(p), cfg))
+    prot.update(p for p, b in info.items() if b['pgid'] in groups or config_protected(b, _cwd_cache.get(p, ""), cfg))
     while True:
         children = {p for p, b in info.items() if b['ppid'] in prot}
         if children <= prot:
@@ -434,7 +454,7 @@ def cmd_scan(args):
         info, units = data
         out = [f"agentscope v{VERSION} — Agent 会话进程监控"]
         out.append(f"系统总进程: {len(info)}")
-        orphan_n = sum(1 for g in units if g["orphan"] and not g["protected"])
+        orphan_n = sum(1 for g in units if cleanable(g, info))
         live_n = sum(1 for g in units if not g["orphan"])
         out.append(f"可清理孤儿组: {orphan_n}   存活组: {live_n}")
         out.append(format_units(units, info, limit=args.limit))
@@ -477,69 +497,123 @@ def cmd_tree(args):
     return 0
 
 
-def cleanable(g, info):
-    return (g['pgid'] > 1 and g['orphan'] and not g['protected']
-            and not g['has_live_session'] and not g['ports']
+def cleanable(g, info, cfg=None):
+    cfg = cfg or load_config()
+    return (cfg.get('valid', True) and g.get('config_valid', True)
+            and g['pgid'] > 1 and g['orphan'] and not g['protected']
+            and not g['has_live_session'] and not g['ports'] and not g.get('ports_unknown', True)
             and all(info[p].get('start_time', 0) > 0 and info[p].get('uid') == os.getuid() for p in g['members'])
-            and not set(g['members']).intersection(my_protected_pids(info)))
+            and not set(g['members']).intersection(my_protected_pids(info, cfg=cfg)))
 
 
-def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None):
-    """Revalidate the complete group, audit first, then signal known identities only."""
-    info, units = analyze()
-    g = next((u for u in units if u['pgid'] == pgid), None)
-    if not g or not cleanable(g, info) or (expected and expected['identities'] != g['identities']):
-        audit('kills', {'mode': mode, 'pgid': pgid, 'members': [], 'reason': 'revalidation failed', 'result': 'skipped'})
-        return False
-    members = [{k: info[p].get(k, '') for k in ('pid', 'comm', 'cmdline')} | {'cwd': proc_cwd(p)} for p in g['members']]
-    record = {'mode': mode, 'pgid': pgid, 'members': members, 'reason': g['reason']}
-    audit('kills', dict(record, result='dry-run' if dry_run else 'attempt'))
-    if dry_run:
-        print(f'[dry-run] 将终止 pgid {pgid}')
-        return True
-    # Avoid killpg: new/reused members must never inherit permission to be killed.
-    def survivors():
-        result = []
-        for p in g['members']:
-            b = proc_bsdinfo(p)
-            if b and b.get('start_time') == info[p].get('start_time') and proc_pgid(p) == pgid:
-                result.append(p)
-        return result
-    sent = set()
-    def depth(pid):
-        visited = set()
-        while pid in info and info[pid]['ppid'] in g['members'] and pid not in visited:
-            visited.add(pid)
-            pid = info[pid]['ppid']
-        return len(visited)
-    def send(sig):
-        for p in sorted(g['members'], key=depth, reverse=True):
-            if p in survivors():
-                try:
-                    os.kill(p, sig)
-                    sent.add(p)
-                except (ProcessLookupError, PermissionError):
-                    pass
-    send(signal.SIGTERM)
-    deadline = time.monotonic() + timeout
-    while survivors() and time.monotonic() < deadline:
-        time.sleep(.2)
-    if survivors():
-        send(signal.SIGKILL)
-        time.sleep(.2)
-    ok = not survivors()
-    audit('kills', dict(record, result=('cleaned' if sent else 'gone') if ok else 'remaining'))
-    return ok and bool(sent)
+def revalidate_group(pgid, cfg, deadline=None):
+    """One kernel snapshot, target metadata and ports; never a full analyze per group."""
+    info = scan_processes(deadline=deadline)
+    members = [p for p, b in info.items() if b['pgid'] == pgid]
+    if not members:
+        return info, None
+    load_cwds_batch(members, deadline=deadline)
+    load_apps_batch(members, deadline=deadline)
+    ports = load_listening_ports(deadline=deadline)
+    g = classify_group(pgid, members, info, cfg=cfg, ports_query=lambda: ports,
+                       tty_query=lambda: set())
+    return info, g
+
+
+def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
+               deadline=None, outcome=None):
+    """Signal only confirmed identities; audit errors never change cleanup results."""
+    outcome = outcome if outcome is not None else {}
+    cfg = load_config()
+    record = {'mode': mode, 'pgid': pgid, 'members': [], 'reason': ''}
+    def finish(result, reason=None):
+        outcome['result'] = result
+        if reason:
+            record['reason'] = reason
+        audit('kills', dict(record, result=result))
+        return result in ('cleaned', 'gone', 'dry-run')
+    if not cfg['valid']:
+        return finish('skipped', 'invalid config')
+    try:
+        remaining(deadline, 1)
+        info, g = revalidate_group(pgid, cfg, deadline)
+        if not g:
+            if expected and all(parent_exited(p, {}) for p in expected['members']):
+                return finish('gone', 'confirmed members have exited')
+            return finish('skipped', 'group unavailable; exit cannot be confirmed')
+        if not cleanable(g, info, cfg=cfg):
+            return finish('skipped', 'revalidation failed')
+        if expected and group_key(expected) != group_key(g):
+            return finish('skipped', 'root identity changed')
+        # Child churn is allowed, but only matching, previously confirmed identities are signalled.
+        identities = expected['identities'] if expected else g['identities']
+        members = [p for p in g['members'] if identities.get(str(p)) == info[p]['start_time']]
+        record.update(members=[{k: info[p].get(k, '') for k in ('pid', 'comm', 'cmdline')} |
+                               {'cwd': proc_cwd(p)} for p in members], reason=g['reason'])
+        if dry_run:
+            print(f'[dry-run] 将终止 pgid {pgid}')
+            return finish('dry-run')
+        audit('kills', dict(record, result='attempt'))
+        def survivors():
+            result = []
+            for p in members:
+                b = proc_bsdinfo(p)
+                if b and b.get('status') == 5:  # SZOMB has exited, awaiting reaping.
+                    continue
+                if b and b.get('start_time') == identities[str(p)] and proc_pgid(p) == pgid:
+                    result.append(p)
+                elif b is None and not parent_exited(p, {}):
+                    result.append(p)  # Unknown is not proof of exit.
+            return result
+        sent = set()
+        def depth(pid):
+            visited = set()
+            while pid in info and info[pid]['ppid'] in members and pid not in visited:
+                visited.add(pid)
+                pid = info[pid]['ppid']
+            return len(visited)
+        def send(sig):
+            for p in sorted(members, key=depth, reverse=True):
+                remaining(deadline, 1)
+                b = proc_bsdinfo(p)
+                if b and b.get('status') != 5 and b.get('start_time') == identities[str(p)] and proc_pgid(p) == pgid:
+                    try:
+                        os.kill(p, sig)
+                        sent.add(p)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+        def wait_for_exit(seconds):
+            end = time.monotonic() + remaining(deadline, seconds)
+            while survivors() and time.monotonic() < end:
+                time.sleep(min(.1, max(0, end - time.monotonic())))
+        send(signal.SIGTERM)
+        wait_for_exit(timeout)
+        if survivors():
+            send(signal.SIGKILL)
+            wait_for_exit(1.5)
+        if survivors():
+            return finish('remaining')
+        # New members were not authorized; report them rather than claiming whole-group success.
+        current = scan_processes(deadline=deadline)
+        if any(b['pgid'] == pgid and b.get('status') != 5 for b in current.values()):
+            return finish('remaining', 'new or remaining group members')
+        return finish('cleaned' if sent else 'gone')
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return finish('skipped', 'deadline exceeded')
 
 
 def cmd_clean(args):
-    info, units = analyze()
+    cfg = load_config()
+    if not cfg["valid"]:
+        audit("kills", {"mode": "clean", "result": "skipped", "reason": "invalid config", "pgid": None, "members": []})
+        return 0
+    info, units = analyze(cfg=cfg)
     targets = []
     skipped_live = []
     for g in units:
         if g.get('has_live_session'):
             skipped_live.append(g)
-        if cleanable(g, info):
+        if cleanable(g, info, cfg=cfg):
             targets.append(g)
 
     if not targets:
@@ -556,8 +630,9 @@ def cmd_clean(args):
         print(f"      {pnames}")
 
     if not args.yes or args.dry_run:
-        for g in targets:
-            kill_group(g['pgid'], dry_run=True, expected=g)
+        if args.dry_run:
+            for g in targets:
+                audit("kills", {"mode": "clean", "pgid": g["pgid"], "members": [dict(info[p], cwd=proc_cwd(p)) for p in g["members"]], "reason": g["reason"], "result": "dry-run"})
         print(f"\n这是 dry-run。加 --yes 实际执行，或 --dry-run 明确跳过。")
         if skipped_live:
             print(f"已跳过 {len(skipped_live)} 个含活跃 Agent 会话的组（安全保护）")
@@ -566,8 +641,10 @@ def cmd_clean(args):
     print()
     ok = 0
     for g in targets:
-        if kill_group(g["pgid"], expected=g):
-            print(f"  ✓ pgid {g['pgid']} 已清理 ({g['size']} 进程)")
+        outcome = {}
+        if kill_group(g["pgid"], expected=g, outcome=outcome):
+            state = '已自行退出' if outcome.get('result') == 'gone' else '已清理'
+            print(f"  ✓ pgid {g['pgid']} {state} ({g['size']} 进程)")
             ok += 1
         else:
             print(f"  ✗ pgid {g['pgid']} 部分残留")
@@ -575,47 +652,45 @@ def cmd_clean(args):
     print(f"\n完成：{ok}/{len(targets)} 个进程组已清理，共回收约 {total} 个进程。")
     if skipped_live:
         print(f"跳过 {len(skipped_live)} 个含活跃 Agent 会话的组（安全保护）")
-    return 0
+    return 0 if ok == len(targets) else 1
 
 
 def cmd_watch(args):
-    """守护模式：周期扫描，发现孤儿组即清理"""
-    print(f"agentscope v{VERSION} — 守护模式")
-    print(f"每 {args.interval}s 扫描一次，发现孤儿进程组即清理")
-    print(f"保护：当前会话进程树 + 监听端口的组")
-    print("Ctrl-C 退出\n")
-
-    notifier = Notifier()
-    seen = set()
-    rounds = 0
+    """Run independent rounds; notification/audit failures must not stop cleanup."""
+    print(f'agentscope v{VERSION} — 守护模式，每 {args.interval}s 扫描')
+    notifier, seen = Notifier(), set()
     try:
         while True:
-            rounds += 1
-            info, units = analyze()
-            expire_seen(seen, units)
-            from agentscope_lib import agents as agents_mod
-            notifier.send(agents_mod.alerts(agents_mod.collect()))
-            fresh = [g for g in units if cleanable(g, info) and group_key(g) not in seen]
-
-            if fresh:
-                for g in fresh:
-                    ok = kill_group(g["pgid"], dry_run=args.dry_run, mode='watch', expected=g)
+            try:
+                cfg = load_config()
+                info, units = analyze(cfg=cfg)
+                expire_seen(seen, units)
+                if not cfg['valid']:
+                    audit('kills', {'mode': 'watch', 'pgid': None, 'members': [], 'result': 'skipped', 'reason': 'invalid config'})
+                if cfg['notify']['enabled']:
+                    try:
+                        from agentscope_lib import agents as agents_mod
+                        notifier.send(agents_mod.alerts(agents_mod.collect()), cfg=cfg)
+                    except Exception as error:
+                        print(f'告警采集失败: {error}', file=sys.stderr)
+                for g in units:
+                    if not cleanable(g, info, cfg=cfg) or group_key(g) in seen:
+                        continue
+                    outcome = {}
+                    ok = kill_group(g['pgid'], dry_run=args.dry_run, mode='watch', expected=g, outcome=outcome)
                     if ok:
                         seen.add(group_key(g))
-                    if ok and not args.dry_run:
-                        notifier.send([{'pid': g['pgid'], 'kind': 'WATCH_CLEANED', 'msg': f"已清理 pgid {g['pgid']}"}])
-                    state = "预演" if args.dry_run else "已清理" if ok else "跳过或部分残留"
-                    print(f"[{time.strftime('%H:%M:%S')}] pgid {g['pgid']:<8} "
-                          f"{g['size']:>3} 进程 {state}  "
-                          f"{g['cwd'].replace(os.path.expanduser('~'), '~')[:44]}")
-            else:
-                if rounds % 12 == 0:
-                    print(f"[{time.strftime('%H:%M:%S')}] 第 {rounds} 轮：无新孤儿组 "
-                          f"(总进程 {len(info)})")
-
-            time.sleep(args.interval)
+                    if outcome.get('result') == 'cleaned' and not args.dry_run:
+                        try:
+                            notifier.send([{'pid': g['pgid'], 'kind': 'WATCH_CLEANED', 'msg': f"已清理 pgid {g['pgid']}"}], cfg=cfg)
+                        except Exception as error:
+                            print(f'通知失败: {error}', file=sys.stderr)
+                    print(f"pgid {g['pgid']}: {outcome.get('result', 'skipped')}")
+            except Exception as error:
+                print(f'巡检本轮失败，将继续: {error}', file=sys.stderr)
+            time.sleep(max(.1, args.interval))
     except KeyboardInterrupt:
-        print("\n已退出守护模式。")
+        print('已退出守护模式。')
     return 0
 
 

@@ -8,8 +8,8 @@ class Notifier:
     def __init__(self):
         self.sent = {}
 
-    def send(self, alerts):
-        cfg = load_config()['notify']
+    def send(self, alerts, cfg=None):
+        cfg = (cfg or load_config())['notify']
         if not cfg['enabled']:
             return
         now = time.monotonic()

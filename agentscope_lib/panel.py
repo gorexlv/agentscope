@@ -7,7 +7,9 @@ import time
 import tty
 from . import agents, cleanup, render, nodeheap
 from .cli import sort_sessions
-from .notify import Notifier, group_key
+from .notify import group_key
+from .panel_worker import PanelWorker
+from .lifecycle import exit_on_signals
 
 
 def read_key(timeout):
@@ -34,13 +36,18 @@ def tree_lines(group, info):
 
 
 def run(args):
+    with exit_on_signals():
+        return _run(args)
+
+
+def _run(args):
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     selected = None
     expanded = False
     sort = 0
     keys = ['mem', 'cpu', 'ctx', 'cost', 'tokens']
-    notifier = Notifier()
+    worker = PanelWorker(args)
     pending = None
     message = ''
     deadline = 0
@@ -52,15 +59,15 @@ def run(args):
         tty.setraw(fd)
         sys.stdout.write(render.HIDE_CURSOR)
         while True:
-            if time.monotonic() >= deadline:
-                info, groups = cleanup.analyze()
-                sess = agents.collect(context_limit=args.context_limit)
-                notifier.send(agents.alerts(sess))
-                node_rows = nodeheap.collect() if args.node else None
+            update = worker.poll()
+            if update and 'message' in update:
+                message = update['message']
+            if update and 'groups' in update:
+                info, groups = update['info'], update['groups']
+                sess, node_rows = update['sess'], update['nodes']
                 if selected not in [group_key(g) for g in groups]:
                     selected = group_key(groups[0]) if groups else None
                     pending = None
-                deadline = time.monotonic() + max(.1, args.refresh)
             sort_sessions(sess, keys[sort])
             lines = ['agentscope · 排序 ' + keys[sort], render.session_table(sess), render.summary_line(agents.totals(sess)), render.alerts_section(agents.alerts(sess))]
             if node_rows is not None:
@@ -68,20 +75,20 @@ def run(args):
             lines.extend(['', '进程组（选择清理目标）'])
             for g in groups:
                 active = group_key(g) == selected
-                status = '可清理' if cleanup.cleanable(g, info) else '保留'
+                status = '可清理' if g.get('can_clean', False) else '保留'
                 lines.append(('> ' if active else '  ') + f"pgid {g['pgid']} · {g['size']} 进程 · {status} · {g['cwd']}")
                 if active and expanded:
                     lines.extend(tree_lines(g, info))
             lines.extend(['', message, '↑↓/jk 选择 · Enter 展开 · c 清理（y 确认） · s 排序 · q 退出'])
             sys.stdout.write(render.CLEAR + '\r\n'.join(line.replace('\n', '\r\n') for line in lines))
             sys.stdout.flush()
-            key = read_key(max(0, deadline - time.monotonic()))
+            key = read_key(.1)
             if key in ('q', '\x03'):
                 break
             if pending is not None:
                 if key == 'y':
-                    ok = cleanup.kill_group(pending['pgid'], mode='panel', expected=pending)
-                    message = '已清理' if ok else '已跳过或仍有残留'
+                    worker.request(pending)
+                    message = '清理请求已提交，正在重新校验'
                     pending = None
                     deadline = 0
                 elif key:
@@ -98,12 +105,13 @@ def run(args):
                 sort = (sort + 1) % len(keys)
             elif key == 'c' and selected:
                 g = next(g for g in groups if group_key(g) == selected)
-                if cleanup.cleanable(g, info):
+                if g.get('can_clean', False):
                     pending = g
                     message = f"确认清理 pgid {g['pgid']}？按 y 确认，其他键取消"
                 else:
                     message = '该组受保护或不是可清理的孤儿组'
     finally:
+        worker.close()
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write(render.SHOW_CURSOR + render.RESET + '\n')
         sys.stdout.flush()

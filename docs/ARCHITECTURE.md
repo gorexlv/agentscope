@@ -56,7 +56,7 @@ Electron 的 `(Renderer)` 也被误伤。
 
 1. 根进程自身是 shell / 开发工具：`bash` `zsh` `fish` `sh` `node` `python3` `head` `tail` `deno` `bun`
 2. 根进程的 **cwd 落在工作区目录内**
-3. 根进程 ppid 为 1 或父进程不在快照中；活父进程即使不同 pgid 也不能清理
+3. 根进程 ppid 为 1 或直接探测确认不存在；kill(pid, 0) 仅 ESRCH 表示退出，EPERM/未知均保留
 
 桌面应用的 cwd 是 `/` 或 `.app` 内部路径，天然不满足条件。
 
@@ -111,9 +111,11 @@ n/
 ## 清理与进程身份
 
 `bin/agentscope` 仅保留包路径引导与 CLI 入口；实现集中在 `cleanup.py`。
-`kill_group` 重新分析快照，要求候选成员 PID + 内核启动时间与确认时相同。
+`kill_group` 用内核快照、目标 cwd/app 元数据及端口做轻量复核，不再每组全量 analyze。
+根进程身份必须不变，已退出的子进程可以消失，新增子进程不继承授权；仍有新成员时返回 remaining。
 仅允许当前 uid、已知启动时间、无监听端口且无任何保护条件的组。
-先写审计 attempt，再按进程树深度从子到父发送 TERM；超时再发送 KILL。
+先尝试写审计 attempt，再按进程树深度从子到父发送 TERM；超时再发送 KILL，并轮询 1.5 秒。
+审计写入失败返回 False 并警告，清理照常，返回值只反映清理结果。SZOMB 视为退出，自行退出记 gone。
 每次信号前核对 PID、启动时间和 pgid；不向新加入的成员广播 killpg。
 检查与信号之间仍有无法用标准库完全消除的竞态窗口。
 
@@ -173,13 +175,18 @@ pbi_comm   @48  (16 bytes)   pbi_name @64 (32 bytes)
 
 ## Hardening 模块与状态
 
-- `config.py`：JSON 类型校验、工作区边界、保护规则。路径 `AGENTSCOPE_CONFIG` > 默认路径；工作区环境变量优先。非法配置失败关闭；命令行未知且存在命令行保护规则时保护成员。
+- `config.py`：JSON 类型校验、工作区边界、保护规则。路径 `AGENTSCOPE_CONFIG` > 默认路径；工作区环境变量优先。按文件版本缓存；非法配置只读回退并警告、通知关闭、清理跳过；命令行未知且存在命令行保护规则时保护成员。
 - `procstat.py`：统一内核枚举，`pbi_start_tvsec@120` / `tvusec@128` 合成微秒启动身份；批量 ps 仅补充完整命令行，失败时不猜测。
 - `history.py`：0600 JSONL append，kills 记录 attempt/dry-run/skipped/cleaned/gone/remaining，sessions 记录结束摘要。history 可按类型、天数筛选并忽略损坏行。
 - `notify.py`：osascript 参数传递文本，避免脚本插值；每个实例按 PID + kind 冷却，默认关闭。watch 的 seen 是 `(pgid, 所有根 PID/启动时间)`，每轮与当前组取交集；失败不记 seen。
-- `panel.py`：termios raw 模式，finally 恢复终端；选择通过组身份保持，确认绑定成员快照。非 TTY 走原刷新路径。
+- `panel.py` / `panel_worker.py`：输入线程使用最近快照，单后台线程串行处理采集与确认后的清理，避免共享缓存竞态；进程组刷新周期 20 秒。termios 在 finally 恢复，SIGTERM/SIGHUP handler 抛 SystemExit 并恢复旧 handler。非 TTY 走原刷新路径。
 - `sessions.py`：配置价格覆盖内置精确型号；回退定价通过 cost_estimated 传到会话与汇总渲染。
 - `install.py`：成功复制新备份后，仅删除同目标、严格时间戳命名的旧备份；保留最新一份。
 
-测试使用合成进程快照，可注入 cwd/ports/tty/app 查询。所有信号、通知和面板清理均 mock；
+测试使用合成快照，可注入 cwd/ports/tty/app/parent 查询，并包含只操作自身创建进程身份的真实集成测试；其余信号、通知和面板清理均 mock；
 不运行安装器 main，不修改宿主配置。全量只读冒烟在独立状态目录记录预演历史。
+
+`lifecycle.py` 提供共享 deadline 与信号恢复上下文。hook 总预算 25 秒，stdin 有完整读取预算；
+只做一次进程内 analyze，再逐组轻量复核，查询和等待使用剩余预算，到期不再发新信号。
+摘要 finally 覆盖解析、扫描和 SIGTERM/SIGHUP。watch 默认不采集通知所需资源，告警旁路单独捕获异常，整个单轮也捕获异常并继续。
+端口 None 表示采集失败而非空集合，cleanable 对未知端口禁止清理；所有监听地址均被保护。

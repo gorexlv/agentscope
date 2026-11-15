@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import sys
 
 
 def state_dir():
@@ -9,14 +10,18 @@ def state_dir():
 
 
 def append(kind, record):
-    directory = state_dir()
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    record = dict(record, at=datetime.datetime.now().astimezone().isoformat())
-    fd = os.open(os.path.join(directory, kind + '.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(record, ensure_ascii=False) + '\n')
-        f.flush()
-    return record
+    try:
+        directory = state_dir()
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        record = dict(record, at=datetime.datetime.now().astimezone().isoformat())
+        fd = os.open(os.path.join(directory, kind + '.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+            f.flush()
+        return record
+    except (OSError, ValueError, TypeError) as error:
+        print(f'agentscope: audit {kind} failed: {error}', file=sys.stderr, flush=True)
+        return False
 
 
 def read(kinds, days=None):
