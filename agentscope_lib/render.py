@@ -217,7 +217,14 @@ def session_table(sess_list, w=None):
             f"{GRAY}{short_cwd(s.get('cwd'), 36)}{RESET}"
         )
         out.append(row)
+        state = s.get('activity_state', 'UNKNOWN')
+        shared = s.get('cwd_conflict_pids') or []
+        out.append(f"        state={state}" + (f" · possible cwd conflict {shared}" if shared else ''))
 
+    from . import mcp
+    servers = {g['name']: g for s in sess_list for g in s.get('mcp_servers', [])}
+    if servers:
+        out.append(mcp.render(list(servers.values())))
     # 脚注：解释 CPU% 的含义与合计
     total_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list)
     main_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list

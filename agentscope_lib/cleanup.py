@@ -40,6 +40,8 @@ from agentscope_lib.procstat import list_pids, proc_bsdinfo, scan_processes, pro
 from agentscope_lib.config import load_config, protected as config_protected, within
 from agentscope_lib.history import append as audit
 from agentscope_lib.lifecycle import remaining
+from agentscope_lib.ownership import orca_managed
+from agentscope_lib.ports import abandoned
 from agentscope_lib.notify import Notifier, group_key, expire_seen
 import functools
 import builtins
@@ -283,7 +285,8 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
     orphan = (root_in_ws and root_is_shell and not root_is_desktop
               and all(parent_query(info[p]["ppid"]) for p in roots))
 
-    protected = any(config_protected(info[p], cwd_query(p), cfg) or
+    ownership = {p: orca_managed(p, info) for p in members}
+    protected = any(value is not False for value in ownership.values()) or any(config_protected(info[p], cwd_query(p), cfg) or
                     any(h in (info[p]['comm'] + ' ' + info[p]['name']).lower() for h in DESKTOP_HOSTS) or
                     any(h in app.lower() for app in app_query(p) for h in DESKTOP_HOSTS)
                     for p in members)
@@ -343,6 +346,9 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
         "cwd_concentration": f"{top_n}/{len(members)}",
         "ports": sorted(set(ports)),
         "ports_unknown": port_map is None,
+        "orca_managed": any(value is True for value in ownership.values()),
+        "orca_unknown": any(value is None for value in ownership.values()),
+        "abandoned_server": bool(ports) and all(abandoned(cwd_query(p), cfg) for p in members if (port_map or {}).get(p)),
         "config_valid": cfg.get("valid", True),
         "names": names[:12],
         "root": roots,
@@ -359,6 +365,8 @@ def analyze(info=None, cfg=None, deadline=None):
     info = scan_processes(deadline=deadline) if info is None else info
     # 批量预取 cwd 与端口 —— 这是性能关键点
     load_cwds_batch(list(info.keys()), deadline=deadline)
+    for pid, b in info.items():
+        b["cwd"] = _cwd_cache.get(pid, "")
     load_ports_batch(deadline=deadline)
     load_apps_batch(list(info), deadline=deadline)
     remaining(deadline, 1)
@@ -423,11 +431,11 @@ def format_units(units, info, limit=None):
         if g.get("has_live_session"):
             tag = "活跃会话"
             flag = "· 保留（Agent 仍在运行）"
-        elif g["orphan"]:
+        elif g["orphan"] and cleanable(g, info):
             tag = "残留组"
             flag = "◆ 可一键清理"
         else:
-            tag = "存活组"
+            tag = "受保护残留" if g["orphan"] else "存活组"
             flag = "· 跳过"
         out.append(f"pgid {g['pgid']:<8} {g['size']:>3} 进程  [{tag}]  {flag}")
 
@@ -497,11 +505,12 @@ def cmd_tree(args):
     return 0
 
 
-def cleanable(g, info, cfg=None):
+def cleanable(g, info, cfg=None, allow_abandoned=False):
     cfg = cfg or load_config()
     return (cfg.get('valid', True) and g.get('config_valid', True)
             and g['pgid'] > 1 and g['orphan'] and not g['protected']
-            and not g['has_live_session'] and not g['ports'] and not g.get('ports_unknown', True)
+            and not g['has_live_session'] and (not g['ports'] or (allow_abandoned and g.get('abandoned_server')))
+            and not g.get('ports_unknown', True)
             and all(info[p].get('start_time', 0) > 0 and info[p].get('uid') == os.getuid() for p in g['members'])
             and not set(g['members']).intersection(my_protected_pids(info, cfg=cfg)))
 
@@ -521,7 +530,7 @@ def revalidate_group(pgid, cfg, deadline=None):
 
 
 def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
-               deadline=None, outcome=None):
+               deadline=None, outcome=None, allow_abandoned=False):
     """Signal only confirmed identities; audit errors never change cleanup results."""
     outcome = outcome if outcome is not None else {}
     cfg = load_config()
@@ -541,7 +550,7 @@ def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
             if expected and all(parent_exited(p, {}) for p in expected['members']):
                 return finish('gone', 'confirmed members have exited')
             return finish('skipped', 'group unavailable; exit cannot be confirmed')
-        if not cleanable(g, info, cfg=cfg):
+        if not cleanable(g, info, cfg=cfg, allow_abandoned=allow_abandoned):
             return finish('skipped', 'revalidation failed')
         if expected and group_key(expected) != group_key(g):
             return finish('skipped', 'root identity changed')
@@ -613,7 +622,7 @@ def cmd_clean(args):
     for g in units:
         if g.get('has_live_session'):
             skipped_live.append(g)
-        if cleanable(g, info, cfg=cfg):
+        if cleanable(g, info, cfg=cfg, allow_abandoned=getattr(args, 'abandoned_servers', False)):
             targets.append(g)
 
     if not targets:
@@ -642,7 +651,7 @@ def cmd_clean(args):
     ok = 0
     for g in targets:
         outcome = {}
-        if kill_group(g["pgid"], expected=g, outcome=outcome):
+        if kill_group(g["pgid"], expected=g, outcome=outcome, allow_abandoned=getattr(args, "abandoned_servers", False)):
             state = '已自行退出' if outcome.get('result') == 'gone' else '已清理'
             print(f"  ✓ pgid {g['pgid']} {state} ({g['size']} 进程)")
             ok += 1
@@ -665,6 +674,11 @@ def cmd_watch(args):
                 cfg = load_config()
                 info, units = analyze(cfg=cfg)
                 expire_seen(seen, units)
+                try:
+                    from agentscope_lib import metrics
+                    metrics.write(metrics.sample(info, units))
+                except Exception as error:
+                    print(f'metrics failed: {error}', file=sys.stderr)
                 if not cfg['valid']:
                     audit('kills', {'mode': 'watch', 'pgid': None, 'members': [], 'result': 'skipped', 'reason': 'invalid config'})
                 if cfg['notify']['enabled']:
@@ -718,6 +732,7 @@ def main():
     p.set_defaults(func=cmd_tree)
 
     p = sub.add_parser("clean", help="清理孤儿进程组")
+    p.add_argument("--abandoned-servers", action="store_true", help="允许清理已确认工作区消失且仍监听端口的孤儿组")
     p.add_argument("--yes", action="store_true", help="确认执行")
     p.add_argument("--dry-run", action="store_true", help="只预演")
     p.add_argument("--keep-ports", action="store_true", default=True,
@@ -746,6 +761,8 @@ def main():
     except ImportError as e:
         print(f"提示：Agent 监控子命令不可用（{e}）", file=sys.stderr)
 
+    from agentscope_lib.extensions import register as register_extensions
+    register_extensions(sub)
     args = ap.parse_args()
     return args.func(args)
 

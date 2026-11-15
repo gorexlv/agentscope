@@ -274,3 +274,12 @@ def read_file_tail(path, max_lines=400, max_bytes=2 * 1024 * 1024, from_head=Fal
         return lines
     except Exception:
         return []
+
+
+def task_resources(pid):
+    """PROC_PIDTASKINFO: resident bytes and raw cumulative kernel CPU counters."""
+    raw = ctypes.create_string_buffer(96)
+    size = _libproc.proc_pidinfo(pid, 4, 0, raw, 96)
+    if size < 32:
+        return None
+    return {'rss_bytes': _i64(raw.raw, 8), 'cpu_ticks': _i64(raw.raw, 16) + _i64(raw.raw, 24)}

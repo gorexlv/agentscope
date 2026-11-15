@@ -19,6 +19,8 @@ import time
 
 from . import procstat
 from . import sessions
+from . import activity, mcp
+from .ownership import orca_managed
 
 AGENT_TYPES = ("claude", "codex", "opencode", "devin")
 
@@ -265,7 +267,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             "cost": None, "git_branch": None, "title": None,
             "session_id": None, "session_path": None,
             "last_turn_ms": None, "timestamp": None,
-            "is_main": False,
+            "is_main": _is_session_main(b),
         }
 
         if sess:
@@ -293,8 +295,15 @@ def collect(home=None, with_resources=True, context_limit=None):
         else:
             rec["status"] = "NO_SESSION"
 
+        rec['orca_managed'] = orca_managed(pid, procs)
+        rec.update(activity.state(rec.get('session_path'), rec['cpu_pct'] if with_resources else None))
         out.append(rec)
 
+    servers = mcp.collect(procs, cwds, out, with_resources=with_resources)
+    conflicts = activity.conflicts(out)
+    for rec in out:
+        rec['mcp_servers'] = [g for g in servers if any(rec['pid'] in i['session_pids'] for i in g['instances'])]
+        rec['cwd_conflict_pids'] = next((c['pids'] for c in conflicts if rec['pid'] in c['pids']), [])
     # 主进程排前面，其次按内存降序
     out.sort(key=lambda r: (r["agent_type"], not r["is_main"],
                              -(r.get("mem_mb") or 0)))
@@ -363,7 +372,9 @@ def totals(sess_list):
 
 def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
     """生成告警列表"""
-    out = []
+    out = [{'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
+            'msg':f"Multiple sessions share cwd {c['cwd']}: {c['pids']}; possible file conflict"}
+           for c in activity.conflicts(sess_list)]
     now = time.time()
     for s in sess_list:
         pct = s.get("context_pct")

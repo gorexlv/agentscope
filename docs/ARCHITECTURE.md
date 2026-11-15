@@ -190,3 +190,18 @@ pbi_comm   @48  (16 bytes)   pbi_name @64 (32 bytes)
 只做一次进程内 analyze，再逐组轻量复核，查询和等待使用剩余预算，到期不再发新信号。
 摘要 finally 覆盖解析、扫描和 SIGTERM/SIGHUP。watch 默认不采集通知所需资源，告警旁路单独捕获异常，整个单轮也捕获异常并继续。
 端口 None 表示采集失败而非空集合，cleanable 对未知端口禁止清理；所有监听地址均被保护。
+
+## 范围追加 13–21
+
+- `ownership.py`：当前 Orca 祖先链三态识别（true/false/unknown），unknown 保守保护；会话归属优先祖先 PID，worktree 查找只读本地 .git marker。
+- `mcp.py`：命令行模式提取 MCP 名，内核 RSS 聚合；保留 instance 列表及 ancestor/cwd/cwd-ambiguous/unknown 归属证据。agents.collect 复用已有进程和 cwd 快照，把关联 MCP 注入会话记录，render 在 agents/panel 展示。
+- `ports.py`：每个监听 PID 映射地址、cwd、worktree 和会话；abandoned 仅由配置工作区内明确不存在的 cwd 产生，权限失败不算删除。clean 的显式参数可放行这类端口，但不绕过 cleanable、轻量复核和审计。
+- `activity.py`：读取有界日志尾部的事件类型（不存储消息内容），结合 CPU/写入年龄细分会话状态；120 秒空闲、600 秒疑似卡住/循环。共享 cwd 冲突仅针对主会话，告警不触发系统通知或自动清理。
+- `heavy.py`：固定主机级 lock inode，O_NOFOLLOW 防止锁路径符号链接替换，flock 非阻塞竞争与负载门槛；锁覆盖命令运行期，关闭 fd 自动释放，禁止删除锁文件。
+- `disk.py`：有限深度/时间预算盘点生成目录，统计磁盘分配块、去重硬链接、不跟随 symlink；历史会话和 gitdir 指针提供删除工作区证据。显式删除路径白名单，复用 analyze/cleanable 做进程检查且拒绝任何使用中的工作区，再核对目录 inode，审计后删除；不清理 Git 元数据。
+- `doctor.py`：仅文件读取，凭据只输出状态，额度仅保留数字白名单字段；不输出认证信息、不执行登录程序、不联网。
+- `metrics.py`：watch 在现有 info/units 上补充低成本内核资源与 vm_stat，通知资源采集仍为可选旁路。flock 串行轮转/append，默认 1 MiB + 3 归档；timeline 支持带时区 ISO 或相对 m/h/d。
+- `extensions.py`：mcp/ports/disk/doctor/timeline/run 的 CLI 注册。默认只读，run --dry-run 不获取锁或执行命令，磁盘删除与遗弃端口清理均要求显式用户参数。
+
+限制：MCP 命名模式和会话状态是启发式；同 cwd 不能证明具体会话归属；Orca 祖先已退出后无法追溯历史归属。
+磁盘目录 inode/进程检查与 rmtree 非原子，指标 RSS 和原 footprint 口径不同，额度和登录状态均不能替代在线验证。
