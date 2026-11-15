@@ -24,6 +24,7 @@ import os
 import subprocess
 import tempfile
 import time
+from .lifecycle import remaining
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"))
 _libproc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
@@ -70,6 +71,7 @@ def proc_bsdinfo(pid):
     if len(d) < 96:
         return None
     return {
+        "start_time": _i64(d, 120) * 1000000 + _i64(d, 128) if len(d) >= 136 else 0,
         "pid": _i32(d, 12),
         "ppid": _i32(d, 16),
         "uid": _i32(d, 20),
@@ -115,7 +117,7 @@ def proc_parent(pid):
     return b["ppid"] if b else 0
 
 
-def scan_processes():
+def scan_processes(deadline=None):
     """全量进程快照"""
     out = {}
     for pid in list_pids():
@@ -124,12 +126,20 @@ def scan_processes():
             b["pgid"] = proc_pgid(pid)
             b["path"] = proc_path(pid)
             out[pid] = b
+    try:
+        result = subprocess.run(['ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=remaining(deadline, 10))
+        for line in result.stdout.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in out:
+                out[int(parts[0])]['cmdline'] = parts[1]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     return out
 
 
 # ── cwd / 端口 / 内存：批量采集 ─────────────────────────────────
 
-def load_cwds(pids):
+def load_cwds(pids, deadline=None):
     """批量取 cwd。lsof 的 -F pn 输出格式为 p<pid> 后跟 n<path>。"""
     result = {}
     if not pids:
@@ -138,7 +148,7 @@ def load_cwds(pids):
         r = subprocess.run(
             ["lsof", "-a", "-d", "cwd", "-F", "pn", "-p",
              ",".join(str(p) for p in pids)],
-            capture_output=True, text=True, timeout=30).stdout
+            capture_output=True, text=True, timeout=remaining(deadline, 30)).stdout
         cur = None
         for line in r.splitlines():
             if line.startswith("p"):
@@ -151,21 +161,25 @@ def load_cwds(pids):
     return result
 
 
-def load_listening_ports():
-    """pid -> [监听地址列表]"""
-    result = {}
+def load_listening_ports(deadline=None):
+    """All TCP listeners; None means unknown, never equivalent to no listeners."""
     try:
-        r = subprocess.run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
-                           capture_output=True, text=True, timeout=25).stdout
-        for line in r.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) >= 9 and parts[1].isdigit():
-                addr = parts[-1]
-                if addr.startswith(("*:", "127.0.0.1:", "localhost:", "[::1]:")):
-                    result.setdefault(int(parts[1]), []).append(addr)
-    except Exception:
-        pass
-    return result
+        result = subprocess.run(['lsof', '-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn'],
+                                capture_output=True, text=True, timeout=remaining(deadline, 25))
+        if result.returncode not in (0, 1) or result.stderr.strip():
+            return None
+        # lsof returns 1 with empty output when no files match.
+        if result.returncode == 1 and result.stdout.strip():
+            return None
+        ports, pid = {}, None
+        for line in result.stdout.splitlines():
+            if line.startswith('p'):
+                pid = int(line[1:]) if line[1:].isdigit() else None
+            elif line.startswith('n') and pid is not None:
+                ports.setdefault(pid, []).append(line[1:])
+        return ports
+    except (OSError, subprocess.TimeoutExpired, TimeoutError):
+        return None
 
 
 def footprint_mb(pid):
@@ -260,3 +274,12 @@ def read_file_tail(path, max_lines=400, max_bytes=2 * 1024 * 1024, from_head=Fal
         return lines
     except Exception:
         return []
+
+
+def task_resources(pid):
+    """PROC_PIDTASKINFO: resident bytes and raw cumulative kernel CPU counters."""
+    raw = ctypes.create_string_buffer(96)
+    size = _libproc.proc_pidinfo(pid, 4, 0, raw, 96)
+    if size < 32:
+        return None
+    return {'rss_bytes': _i64(raw.raw, 8), 'cpu_ticks': _i64(raw.raw, 16) + _i64(raw.raw, 24)}

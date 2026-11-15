@@ -19,6 +19,8 @@ import time
 
 from . import procstat
 from . import sessions
+from . import activity, mcp
+from .ownership import orca_managed
 
 AGENT_TYPES = ("claude", "codex", "opencode", "devin")
 
@@ -265,7 +267,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             "cost": None, "git_branch": None, "title": None,
             "session_id": None, "session_path": None,
             "last_turn_ms": None, "timestamp": None,
-            "is_main": False,
+            "is_main": _is_session_main(b),
         }
 
         if sess:
@@ -279,6 +281,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             rec["is_main"] = _is_session_main(b)
             if rec["is_main"]:
                 rec.update(data)
+                rec["cost_estimated"] = sessions.cost_estimated(rec["model"])
                 rec["cost"] = sessions.calculate_cost(
                     rec["model"], rec["input_tokens"], rec["output_tokens"],
                     rec["cache_create_tokens"], rec["cache_read_tokens"], at)
@@ -292,8 +295,15 @@ def collect(home=None, with_resources=True, context_limit=None):
         else:
             rec["status"] = "NO_SESSION"
 
+        rec['orca_managed'] = orca_managed(pid, procs)
+        rec.update(activity.state(rec.get('session_path'), rec['cpu_pct'] if with_resources else None))
         out.append(rec)
 
+    servers = mcp.collect(procs, cwds, out, with_resources=with_resources)
+    conflicts = activity.conflicts(out)
+    for rec in out:
+        rec['mcp_servers'] = [g for g in servers if any(rec['pid'] in i['session_pids'] for i in g['instances'])]
+        rec['cwd_conflict_pids'] = next((c['pids'] for c in conflicts if rec['pid'] in c['pids']), [])
     # 主进程排前面，其次按内存降序
     out.sort(key=lambda r: (r["agent_type"], not r["is_main"],
                              -(r.get("mem_mb") or 0)))
@@ -335,13 +345,13 @@ def totals(sess_list):
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_create_tokens": 0,
         "cost": 0.0, "mem_mb": 0.0, "cpu_pct": 0.0,
-        "by_type": {},
+        "by_type": {}, "cost_estimated": False,
     }
     for s in sess_list:
         # 内存 / CPU 是进程级的，全部累加
         t["mem_mb"] += s.get("mem_mb") or 0.0
         t["cpu_pct"] += s.get("cpu_pct") or 0.0
-        bt = t["by_type"].setdefault(s["agent_type"], {"n": 0, "cost": 0.0, "mem": 0.0})
+        bt = t["by_type"].setdefault(s["agent_type"], {"n": 0, "cost": 0.0, "mem": 0.0, "cost_estimated": False})
         bt["n"] += 1
         bt["mem"] += s.get("mem_mb") or 0.0
         # token 与成本是会话级的 —— 只算主进程，避免同一会话重复计费
@@ -351,6 +361,8 @@ def totals(sess_list):
         t["output_tokens"] += s.get("output_tokens") or 0
         t["cache_read_tokens"] += s.get("cache_read_tokens") or 0
         t["cache_create_tokens"] += s.get("cache_create_tokens") or 0
+        t["cost_estimated"] |= bool(s.get("cost_estimated"))
+        bt["cost_estimated"] |= bool(s.get("cost_estimated"))
         t["cost"] += s.get("cost") or 0.0
         bt["cost"] += s.get("cost") or 0.0
     # 会话数按主进程计
@@ -360,7 +372,9 @@ def totals(sess_list):
 
 def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
     """生成告警列表"""
-    out = []
+    out = [{'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
+            'msg':f"Multiple sessions share cwd {c['cwd']}: {c['pids']}; possible file conflict"}
+           for c in activity.conflicts(sess_list)]
     now = time.time()
     for s in sess_list:
         pct = s.get("context_pct")

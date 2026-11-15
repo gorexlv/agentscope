@@ -211,13 +211,20 @@ def session_table(sess_list, w=None):
             f"{cell(mem_s, 9, mem_color(mem))} "
             f"{cell(ctx_s, 5, ctx_color(ctx))} "
             f"{cell(sessions.format_tokens(tokens), 9)} "
-            f"{cell(sessions.format_cost(cost), 8)} "
+            f"{cell(sessions.format_cost(cost, s.get('cost_estimated', False)), 8)} "
             f"{cell(_trunc(s.get('model') or '-', 22), 22)} "
             f"{cell(_trunc(s.get('git_branch') or '-', 18), 18)} "
             f"{GRAY}{short_cwd(s.get('cwd'), 36)}{RESET}"
         )
         out.append(row)
+        state = s.get('activity_state', 'UNKNOWN')
+        shared = s.get('cwd_conflict_pids') or []
+        out.append(f"        state={state}" + (f" · possible cwd conflict {shared}" if shared else ''))
 
+    from . import mcp
+    servers = {g['name']: g for s in sess_list for g in s.get('mcp_servers', [])}
+    if servers:
+        out.append(mcp.render(list(servers.values())))
     # 脚注：解释 CPU% 的含义与合计
     total_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list)
     main_cpu = sum((s.get("cpu_pct") or 0) for s in sess_list
@@ -300,7 +307,7 @@ def summary_line(t):
     parts = [
         f"{BOLD}{t['sessions']} 个会话{RESET}",
         f"token {sessions.format_tokens(t['input_tokens'] + t['output_tokens'])}",
-        f"成本 {sessions.format_cost(t['cost'])}",
+        f"成本 {sessions.format_cost(t['cost'], t.get('cost_estimated', False))}",
         f"内存 {t['mem_mb'] / 1024:.2f} GB",
         f"CPU {t['cpu_pct']:.0f}%",
     ]

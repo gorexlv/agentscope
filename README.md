@@ -134,7 +134,7 @@ python3 install/install.py --uninstall
 
 1. 子进程**继承父进程的进程组**（pgid）
 2. 父进程退出后，子进程成为孤儿（ppid=1）但**保留原 pgid**
-3. `killpg(pgid)` 可一次性终止整组残留进程
+3. 清理前复核完整进程组，再逐个核对 PID + 启动时间发送信号
 
 因此按 pgid 聚合，就能把"某次 Agent 会话残留的全部进程"识别为一个可清理单元。
 
@@ -146,10 +146,11 @@ macOS 上所有桌面应用（Arc、Claude、ChatGPT、Lark、Logseq、Paseo…�
 `launchd` 拉起后 reparent 到 init 的，根进程 ppid 同样是 1，但它们完全健康。
 早期版本按 ppid 判定，差点把整屏桌面应用当垃圾清掉。
 
-真正的判据是**两条同时成立**：
+真正的判据是**所有根节点同时满足三条条件**：
 
 | 条件 | 说明 |
 |---|---|
+| 根进程父进程已退出 | ppid 为 1，或直接探测确认不存在；权限不足视为存活 |
 | 根进程自身是 shell / 开发工具 | bash、zsh、fish、node、python… |
 | 根进程的 cwd 落在工作区目录内 | 桌面应用的 cwd 是 `/`，据此可精确区分 |
 
@@ -220,10 +221,13 @@ lsof -a -d cwd -F pn -p <pid列表>
 `-F pn` 输出格式是 `p<pid>` 后跟 `n<path>`（**不能用默认表格格式解析**），
 整体耗时降到 **1.06 秒，提升约 20 倍**。
 
-### killpg 在受限环境会失败
+### 清理前复核
 
-沙箱不允许影响其它进程组，`killpg` 返回 `EPERM`。此时降级为逐进程 kill，
-且必须**先子后父**（父进程先死会留下孤儿）。
+clean、watch、hook、panel 共用清理入口。先重新扫描并核对成员身份、
+父进程、白名单、当前进程树、活跃 Agent 和监听端口；拒绝未知启动时间和其他用户的进程。
+每次发送 TERM / KILL 前再次核对 PID、启动时间和 pgid，按子先父后的顺序处理。
+内核检查与发信号并非原子操作，仍存在极短竞态窗口；本项目不声称能消除全部 PID 复用风险。
+
 
 ### 判断活跃度不用 CPU 时间
 
@@ -258,3 +262,130 @@ lsof -c claude -c node -d 0,1,2
 ## License
 
 MIT
+
+## 配置、历史与面板操作
+
+配置路径为 `~/.config/agentscope/config.json`，可用 `AGENTSCOPE_CONFIG` 覆盖。
+文件缺失使用默认配置；无效 JSON、字段值或读取错误会在 stderr 警告，只读显示回退默认值且关闭通知，清理记录 skipped 并跳过，守护进程继续下一轮。配置按文件版本缓存，变更后重新解析。示例：
+
+```json
+{
+  "workspaces": ["~/Projects", "~/Workbuddy"],
+  "protect": {
+    "comm": ["WorkBuddy", "Orca", "my-daemon"],
+    "cmdline": ["*--keep-running*"],
+    "cwd": ["*/important-service/*"]
+  },
+  "notify": {"enabled": false, "cooldown_minutes": 15},
+  "pricing": {
+    "my-model": {"input": 1, "output": 2, "cacheWrite": 1.25, "cacheRead": 0.1}
+  }
+}
+```
+
+`protect` 每个字段替换该字段的默认规则；字段之间为 OR，任一成员命中即保护整组。
+普通字符串做不区分大小写的子串匹配，包含 `* ? [` 的规则做 glob 匹配。
+命令行无法采集且启用了命令行规则时，保守地保护该进程。
+默认 comm 规则匹配桌面应用名前缀，cmdline 仅匹配 app bundle 路径，不会因工作区路径含 orca 而保护开发脚本。当前进程的祖先、同组进程及其后代也受到保护。
+工作区按规范化路径边界匹配，`/work` 不会匹配 `/workspace`；默认增加 `~/Workbuddy`。
+`AGENTSCOPE_WORKSPACES`（冒号分隔）优先于配置文件，保留兼容性。
+
+通知默认关闭；开启后，watch 和 panel 仅发送 `CONTEXT_LOW`、`MEM_HIGH`，以及 watch
+实际清理成功事件。每个监控实例按 PID + 告警类型限频，默认 15 分钟；重启实例后冷却重置。
+价格单位为美元 / 百万 token，覆盖项必须包含四项非负单价；非精确型号使用回退价格时，
+JSON 提供 `cost_estimated`，会话表和总成本以 `≈` 标识。内置价格是静态参考，未在线核价。
+
+终端面板：`↑↓` / `j k` 选择进程组，Enter 展开进程树，`c` 请求清理，`y` 二次确认
+（其他键取消），`s` 切换会话排序，`q` 退出。确认绑定根进程与已展示成员身份；新增子进程不继承清理授权。
+采集和清理在同一后台线程执行，输入保持响应；进程组每 20 秒采集一次，清理前重新验证。
+SIGTERM/SIGHUP 与异常退出都会恢复终端。
+非 TTY 保持自动刷新模式，Ctrl-C 退出。
+
+```bash
+agentscope history --kills --days 7 --json
+agentscope history --sessions
+```
+
+历史位于 `~/.local/state/agentscope/kills.jsonl` 与 `sessions.jsonl`，可用
+`AGENTSCOPE_STATE_DIR` 指定隔离测试目录。新文件权限为 0600。
+清理历史包含时间、模式、成员 PID/名称/命令行/cwd、理由与结果；实际清理前先写 attempt，
+审计失败只写 stderr 警告，不阻止清理，也不改变清理结果。dry-run 复用当前快照记录预演，不发送信号，即便同时传入 `--yes`；普通 clean 未确认时只打印列表。
+历史包含本地路径和命令行，请注意其中可能出现的敏感参数。
+SessionEnd 即使没有残留也记录会话摘要；传入 transcript_path 时附带 token 和估算成本。
+安装器每个目标仅保留最新一份自身生成的时间戳备份，不删除其他命名的文件。
+
+开发验证：`python3 -m unittest discover -s tests`（标准库）。专用集成用例只对自身派生、核对过启动身份的进程发送真实信号；其余信号、通知和面板清理均 mock。
+
+端口采集覆盖所有 TCP LISTEN 地址，失败或超时标为未知并禁止清理。
+清理结果区分 `gone`（自行退出）、`cleaned`、`remaining`；僵尸进程视为已退出，KILL 后最多轮询 1.5 秒。
+clean 实际清理未全部成功时返回非零。
+
+hook 在进程内分析一次，总预算 25 秒（stdin 最多 1 秒）；后续仅复核目标组元数据和端口。
+到期跳过剩余组，SIGTERM/SIGHUP 或解析异常也尽量写入会话摘要。
+精确祖先匹配没有可清理目标时，按会话 cwd 或其子目录回退，不匹配 cwd 的父目录。
+同目录下其他已确认的孤儿也可能被选中，因此它不是基于 session_id 的严格归属证明。
+launchd 拉起的长期 shell/python 工作任务仍可能符合残留判据，请为这类任务配置白名单。
+备份只保留最新一份，重复安装会替换首次安装前备份；Codex 卸载还原依赖 codex_original_notify 记录。
+
+## 会话与机器资源视图
+
+```bash
+agentscope mcp --json                  # MCP 名称、重复实例、RSS 合计及会话归属
+agentscope ports --json                # 所有 TCP LISTEN 地址、会话 PID 与 worktree
+agentscope disk --json                 # 生成目录大小与已删除 worktree 的残留线索
+agentscope doctor --json               # 只读本地凭据状态、历史额度及 hook/notify 检查
+agentscope timeline --since 2h --json   # 最近两小时 watch 采样（也接受 ISO 时间）
+agentscope run --heavy --max-load 4 -- npm run build
+agentscope run --heavy --dry-run -- npm run build
+```
+
+MCP 通过命令行中的已知 server/package 名模式识别，按名字聚合实例数和 RSS。
+会话归属优先祖先链，退化 cwd 匹配时明确标记；同目录多个会话标为 ambiguous，不能据此自动清理重复实例。
+agents 与 panel 展示归属到会话的 MCP，mcp 命令也展示没有找到会话的实例。
+RSS 与 footprint 的物理内存统计口径不同；采集不全时标为 partial。
+
+会话状态包括 WAITING_INPUT、WAITING_PERMISSION、WORKING、IDLE、SUSPECTED_STALL、SUSPECTED_LOOP、UNKNOWN。
+状态由最后有效事件、日志更新时间和 CPU 判断：无写入超过 120 秒且低 CPU 标空闲，超过 600 秒的未完成操作且低 CPU 标疑似卡住，高 CPU 标疑似循环。
+这些都是提示，不作为清理判据。多个主会话共用规范化后的 cwd 时，显示 CWD_CONFLICT，提示可能同时修改文件。
+当前祖先链能识别为 Orca 时保护整个进程组；祖先链不可读或循环时同样保护，不读取和输出进程环境变量。
+
+### 显式维护与排队
+
+端口默认始终受到保护。仅当监听者 cwd 位于配置工作区且确认路径已不存在时标 abandoned，
+`clean --abandoned-servers --dry-run` 可检查建议；实际操作仍需 `--yes`，
+并且必须通过父进程退出、Orca/白名单/当前树保护、配置和端口状态、成员身份等二次校验。
+该开关不用于 watch、hook 或 panel，也不会放行有活父进程的服务。
+
+磁盘视图只统计配置工作区内有限深度的 node_modules、.venv、dist、build、.next、target。
+单次盘点预算 8 秒，超时输出 complete=false 或 size_complete=false，不把部分大小当完整大小。
+历史会话里已删除的目录、Git worktree 的失效 gitdir 元数据也会列出；后者只建议检查 git worktree prune --dry-run。
+`disk --clean /absolute/worktree/node_modules --yes` 才会删除明确选中的生成目录：
+禁止符号链接、工作区根或非白名单目录，并重新检查相关进程；仍有进程使用工作区或 cwd 无法完整采集时跳过。
+磁盘清理不会杀进程，审计记录在 kills.jsonl 的 disk 模式。检查与文件删除之间仍有非原子竞态，请先停止工作区任务。
+
+重任务用默认 `/tmp/agentscope-heavy.lock` 的 flock 在同机协作实例之间排队，
+1 分钟系统负载低于阈值后才执行（默认阈值为逻辑 CPU 数）。可用 `--wait-timeout 秒` 限制等待，超时返回 75；命令退出码原样返回。
+只有使用此入口的任务参与排队。`AGENTSCOPE_HEAVY_LOCK` 可用于隔离测试，不要在正常运行中改成每工作区不同的路径。
+
+### 本地健康与时间序列
+
+doctor 不联网，不调用模型或任何 CLI 登录命令。它只报告 Claude/Codex 本地凭据文件是否包含已识别结构、
+可得的过期提示、最近五份 Codex 日志中的 rate_limits，以及 SessionEnd/notify 配置和包装脚本标记。
+绝不输出 token；present-unverified 不代表服务端登录有效，额度是历史记录而非实时余额。
+
+watch 每轮写 metrics.jsonl：负载、系统 free/active 内存、各 Agent PID 的 RSS 与原始累计 CPU 计数、组数。
+首次样本不计算 CPU 百分比；原始计数用于趋势比较，不能与进程快照的百分比直接混用。
+采样复用当前快照，不调用重量级 agents.collect；通知关闭时也会采样。
+日志达到 1 MiB 后轮转，保留三份归档；timeline 同时读取当前文件和归档，忽略损坏行。
+指标采样或落盘失败只警告，不中断清理。测试覆盖 13–21 各项，真实信号仍只限测试自身创建的进程。
+
+磁盘删除进一步要求：目标位于有 `.git` 标记的 worktree 中，同级具有匹配的项目文件。
+node_modules/dist/.next/build 要求 package.json，.venv 要求 pyproject.toml、requirements*.txt 或 setup.py，
+target 要求 Cargo.toml 或 pom.xml，build 也接受 build.gradle/build.gradle.kts。
+不满足条件的同名目录仅显示占用，deletable=false，不提供删除建议，也不能通过 --yes 绕过。
+
+重任务默认最多等待 300 秒，每 15 秒打印排队状态；可显式用 --wait-timeout 0 选择不限时。
+持锁子命令会继承锁 fd 和 AGENTSCOPE_HEAVY_HELD=1，嵌套调用直接执行，避免自锁。
+包装进程被终止后，子命令持有的 fd 会让锁保持到子命令退出；若子命令主动关闭所有非标准 fd，这种保证不再成立。
+排队是轮询竞争，不保证 FIFO；子命令退出或异常时 fd 关闭并释放锁，不删除锁文件。
+Claude Code 也可能把凭据存放在 macOS Keychain，doctor 的 missing 只代表未找到本地凭据文件，不代表未登录。
