@@ -2,12 +2,14 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import time
 from .config import load_config, within
 from .history import append, read
 from .ownership import worktree_for
 
-ARTIFACTS = {'node_modules', '.venv', 'dist', 'build', '.next', 'target'}
+CACHE_DIRS = {'__pycache__', '.pytest_cache', '.ruff_cache', '.mypy_cache'}
+ARTIFACTS = CACHE_DIRS | {'node_modules', '.venv', 'dist', 'build', '.next', 'target'}
 
 
 
@@ -20,11 +22,18 @@ def deletion_evidence(path, roots):
     patterns = {'node_modules':['package.json'], 'dist':['package.json'], '.next':['package.json'],
                 'build':['package.json','build.gradle','build.gradle.kts'],
                 '.venv':['pyproject.toml','requirements*.txt','setup.py'], 'target':['Cargo.toml','pom.xml']}
+    if name in CACHE_DIRS:
+        patterns[name] = ['pyproject.toml', 'requirements*.txt', 'setup.py']
+        parents = [parent] + [p for p in parent.parents if within(str(p), [worktree])]
+        return worktree if any(p.is_file() and not p.is_symlink() for base in parents
+                              for pattern in patterns[name] for p in base.glob(pattern)) else None
     if not any(p.is_file() and not p.is_symlink() for pattern in patterns.get(name,[]) for p in parent.glob(pattern)):
         return None
     return worktree
 
 def size_of(path, deadline):
+    if os.path.islink(path):
+        return os.lstat(path).st_blocks*512, True
     total, complete, seen = 0, True, set()
     errors = []
     for root, dirs, files in os.walk(path, followlinks=False, onerror=errors.append):
@@ -108,14 +117,26 @@ def clean(path, yes=False):
         return result == 'cleaned'
     if not yes:
         return finish('skipped','explicit --yes required')
-    if not cfg['valid'] or not within(path,cfg['workspaces']) or os.path.basename(path) not in ARTIFACTS:
+    is_link = os.path.islink(path)
+    boundary = os.path.dirname(path) if is_link else path
+    if not cfg['valid'] or not within(boundary,cfg['workspaces']) or os.path.basename(path) not in ARTIFACTS:
         return finish('skipped','invalid config or non-artifact target')
-    if path != os.path.realpath(path) or not os.path.isdir(path) or path in cfg['workspaces']:
+    if boundary != os.path.realpath(boundary) or (not is_link and not os.path.isdir(path)) or path in cfg['workspaces']:
         return finish('skipped','symlink, missing target, or workspace root')
     evidence = deletion_evidence(path,cfg['workspaces'])
     if not evidence:
         return finish('skipped','git worktree and matching project marker required')
-    before = os.stat(path)
+    if is_link:
+        try:
+            prefix = ['git', '--no-optional-locks', '-C', evidence]
+            relative = os.path.relpath(path, evidence)
+            ignored = subprocess.run(prefix+['check-ignore', '-q', '--', relative], capture_output=True, timeout=5)
+            tracked = subprocess.run(prefix+['ls-files', '-z', '--', relative], capture_output=True, timeout=5)
+            if ignored.returncode or tracked.returncode or tracked.stdout:
+                return finish('skipped', 'artifact link must be ignored and untracked')
+        except (OSError, subprocess.TimeoutExpired):
+            return finish('skipped', 'artifact link evidence unavailable')
+    before = os.lstat(path)
     info, groups = cleanup.analyze(cfg=cfg)
     worktree = worktree_for(os.path.dirname(path),cfg["workspaces"])
     cwds = {p: cleanup.proc_cwd(p) for p in info}
@@ -129,12 +150,16 @@ def clean(path, yes=False):
         return finish('skipped','worktree has active processes; stop them explicitly first')
     if deletion_evidence(path,cfg['workspaces']) != evidence:
         return finish('skipped','project evidence changed during validation')
-    current = os.stat(path)
-    if (before.st_dev,before.st_ino) != (current.st_dev,current.st_ino) or os.path.realpath(path) != path:
+    current = os.lstat(path)
+    if ((before.st_dev,before.st_ino,before.st_mode) != (current.st_dev,current.st_ino,current.st_mode)
+            or os.path.realpath(boundary) != boundary):
         return finish('skipped','target changed during validation')
     append('kills',dict(record,result='attempt',reason='explicit generated-artifact deletion'))
     try:
-        shutil.rmtree(path)
+        if is_link:
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
         return finish('cleaned','generated artifact removed')
     except OSError as error:
         return finish('remaining',str(error))

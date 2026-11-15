@@ -45,10 +45,12 @@ def cmd_worktrees(args):
     from . import worktrees
     if args.days is not None and (not math.isfinite(args.days) or args.days < 0):
         raise ValueError('--days must be finite and nonnegative')
+    if not math.isfinite(args.budget) or args.budget <= 0:
+        raise ValueError('--budget must be finite and positive')
     include = set(args.include.split(','))
     if not include <= worktrees.KINDS:
         raise ValueError('--include accepts worktrees,prune,branches,slim')
-    data = worktrees.collect(days=args.days, online=args.online, fetch=args.fetch)
+    data = worktrees.collect(days=args.days, online=args.online, fetch=args.fetch, budget=args.budget)
     if args.action == 'clean':
         data = worktrees.clean(data, yes=args.yes, include=include, days=args.days, online=args.online)
     output(data, args.json)
@@ -61,6 +63,7 @@ def register(sub):
     p.add_argument('--json', action='store_true')
     p.add_argument('--online', action='store_true', help='Look up PR state using gh')
     p.add_argument('--fetch', action='store_true', help='Explicitly refresh remote refs')
+    p.add_argument('--budget', type=float, default=90, help='Inventory time budget in seconds (default: 90)')
     p.add_argument('--days', type=float, help='Idle worktree threshold (default: config or 30)')
     p.add_argument('--yes', action='store_true')
     p.add_argument('--include', default='worktrees,prune,branches,slim')

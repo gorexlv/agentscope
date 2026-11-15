@@ -427,10 +427,147 @@ class WorktreeTests(unittest.TestCase):
         with patch.object(w, 'collect', return_value=data) as collect, patch.object(w.history, 'append', return_value=False):
             record = w.weekly_summary(notifier, cfg)
             self.assertIsNone(w.weekly_summary(notifier, cfg))
-        collect.assert_called_once_with(cfg=cfg, budget=5)
+        collect.assert_called_once_with(cfg=cfg, budget=w.WEEKLY_BUDGET)
         self.assertFalse(record['complete'])
         self.assertIn('unknown', record['counts'])
         self.assertIn('部分盘点', notifier.send.call_args.args[0][0]['msg'])
+
+    def test_slim_preserves_env_and_removes_venv(self):
+        from agentscope_lib import cleanup
+        self.cfgpath.write_text(json.dumps({'workspaces': [str(self.root)], 'worktrees': {'stale_days': 0}}))
+        (self.repo/'pyproject.toml').write_text('[project]\nname="test"')
+        self.g('add', 'pyproject.toml')
+        self.g('commit', '-m', 'python marker')
+        self.g('update-ref', 'refs/remotes/origin/main', 'HEAD')
+        self.ignore('.env')
+        self.ignore('.venv/')
+        (self.repo/'.env').write_text('private')
+        (self.repo/'.venv').mkdir()
+        (self.repo/'.venv/generated').write_text('generated')
+        data = self.report()
+        parent = next(r for r in data['items'] if r['path'] == str(self.repo))
+        self.assertIn('ignored_files', parent['reasons'])
+        self.assertEqual(parent['category'], 'slim')
+        with patch.object(cleanup, 'analyze', return_value=({}, [])):
+            result = w.clean(data, yes=True, include={'slim'})
+        self.assertEqual(result['outcomes'][0]['result'], 'cleaned', result)
+        self.assertEqual((self.repo/'.env').read_text(), 'private')
+        self.assertFalse((self.repo/'.venv').exists())
+
+    def test_artifact_links_unlink_only_and_do_not_measure_target(self):
+        from agentscope_lib import cleanup, disk
+        self.cfgpath.write_text(json.dumps({'workspaces': [str(self.root)], 'worktrees': {'stale_days': 0}}))
+        target = self.root/'shared'
+        target.mkdir()
+        (target/'keep').write_text('must survive')
+        (target/'.git').mkdir()
+        link = self.repo/'node_modules'
+        link.symlink_to(target, target_is_directory=True)
+        self.assertFalse(w.artifact_safe(str(link), str(self.repo), config.load_config(), time.monotonic()+5))
+        self.assertFalse(disk.clean(str(link), yes=True))
+        self.assertEqual((target/'keep').read_text(), 'must survive')
+        self.ignore('node_modules')
+        self.assertTrue(w.artifact_safe(str(link), str(self.repo), config.load_config(), time.monotonic()+5))
+        with patch.object(disk.os, 'walk', side_effect=AssertionError('must not traverse link')):
+            self.assertEqual(w.SizeCache().measure(str(link), time.monotonic()+5)[0], os.lstat(link).st_blocks*512)
+            self.assertEqual(disk.size_of(str(link), time.monotonic()+5)[0], os.lstat(link).st_blocks*512)
+        data = self.report()
+        self.assertTrue(any(r['path'] == str(link) for r in data['artifacts']))
+        with patch.object(cleanup, 'analyze', return_value=({}, [])):
+            result = w.clean(data, yes=True, include={'slim'})
+        self.assertEqual(result['outcomes'][0]['result'], 'cleaned', result)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual((target/'keep').read_text(), 'must survive')
+        self.assertTrue((target/'.git').is_dir())
+        (self.link/'node_modules').symlink_to(target, target_is_directory=True)
+        result = w.clean(self.report(), yes=True, include={'worktrees'})
+        self.assertTrue(any(r['result'] == 'cleaned' for r in result['outcomes']))
+        self.assertEqual((target/'keep').read_text(), 'must survive')
+
+    def test_cache_whitelist_requires_project_marker(self):
+        from agentscope_lib import disk, cleanup
+        self.ignore('__pycache__/')
+        cache = self.link/'__pycache__'
+        cache.mkdir()
+        (cache/'generated.pyc').write_bytes(b'cache')
+        self.assertIn('ignored_files', self.row()['reasons'])
+        (self.link/'pyproject.toml').write_text('[project]\nname="test"')
+        self.g('add', 'pyproject.toml', repo=self.link)
+        self.g('commit', '-m', 'python marker', repo=self.link)
+        self.g('update-ref', 'refs/remotes/origin/main', 'HEAD', repo=self.link)
+        self.assertEqual(self.row()['category'], 'worktrees')
+        with patch.object(cleanup, 'analyze', return_value=({}, [])):
+            self.assertTrue(disk.clean(str(cache), yes=True))
+        self.ignore('arbitrary-cache/')
+        (self.link/'arbitrary-cache').mkdir()
+        (self.link/'arbitrary-cache/CACHEDIR.TAG').write_text('cache tag')
+        self.assertIn('ignored_files', self.row()['reasons'])
+
+    def test_branch_inventory_batches_ancestry(self):
+        for index in range(8):
+            self.g('branch', 'merged-'+str(index))
+        real_git, calls = w.git, []
+        def record(repo, *args, **kwargs):
+            calls.append(args)
+            return real_git(repo, *args, **kwargs)
+        with patch.object(w, 'git', side_effect=record), patch.object(w, 'ancestor', side_effect=AssertionError('not per branch')):
+            rows = w.branch_rows(str(self.repo), w.registrations(self.repo), config.load_config(), time.monotonic()+5)
+        self.assertEqual(sum(r['category'] == 'branches' for r in rows), 8)
+        self.assertEqual(sum(any(a.startswith('--merged=') for a in c) for c in calls), 1)
+        self.assertFalse(any(c[0] == 'rev-list' for c in calls))
+
+    def test_rotation_persists_and_prefers_oldest(self):
+        pairs = [('recent', []), ('old', []), ('never', [])]
+        w.save_checks({'recent': 20, 'old': 10})
+        ordered, stamps = w.repository_order(pairs)
+        self.assertEqual([r for r, _ in ordered], ['never', 'old', 'recent'])
+        stamps['never'] = 30
+        w.save_checks(stamps)
+        self.assertEqual([r for r, _ in w.repository_order(pairs)[0]], ['old', 'recent', 'never'])
+
+    def test_repository_evidence_runs_concurrently_before_sizes(self):
+        import threading
+        pairs = [('one', [{'worktree': str(self.repo)}]), ('two', [{'worktree': str(self.link)}])]
+        barrier = threading.Barrier(2)
+        completed = []
+        def inspect(repo, *args, **kwargs):
+            barrier.wait(timeout=3)
+            completed.append(repo)
+            return {'path': repo, 'exists': False, 'category': 'manual', 'reasons': [], 'bytes': None}
+        with patch.object(w, 'discover', return_value=(pairs, [])), patch.object(w, 'inspect', side_effect=inspect), patch.object(w, 'branch_rows', return_value=[]):
+            data = w.collect(budget=4)
+        self.assertEqual(set(completed), {'one', 'two'})
+        self.assertEqual(len(data['items']), 2)
+
+    def test_cli_budget_is_forwarded(self):
+        import argparse
+        from agentscope_lib import extensions
+        parser = argparse.ArgumentParser()
+        extensions.register(parser.add_subparsers())
+        args = parser.parse_args(['worktrees', '--budget', '17'])
+        with patch.object(w, 'collect', return_value={}) as collect, patch.object(extensions, 'output'):
+            args.func(args)
+        self.assertEqual(collect.call_args.kwargs['budget'], 17)
+
+    def test_weekly_background_returns_without_waiting_and_deduplicates(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        def slow(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=3)
+        with patch.object(w, 'weekly_summary', side_effect=slow):
+            try:
+                start = time.monotonic()
+                self.assertTrue(w.schedule_weekly_summary(cfg=config.load_config()))
+                self.assertLess(time.monotonic()-start, .5)
+                self.assertTrue(entered.wait(timeout=1))
+                self.assertFalse(w.schedule_weekly_summary())
+                with w._weekly_lock:
+                    worker = w._weekly_workers[w.history.state_dir()]
+            finally:
+                release.set()
+            worker.join(timeout=2)
+            self.assertFalse(worker.is_alive())
 
     def test_no_implicit_network(self):
         real_run = w.run

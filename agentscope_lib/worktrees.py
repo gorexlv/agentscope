@@ -1,4 +1,7 @@
 """Bounded inventory and explicit, revalidated Git workspace maintenance."""
+import concurrent.futures
+import threading
+import sys
 import datetime
 import json
 import os
@@ -16,7 +19,10 @@ from .lifecycle import remaining
 
 KINDS = {'worktrees', 'prune', 'branches', 'slim'}
 UNKNOWN_REASONS = {'query_failed', 'process_cwds_unknown', 'path_unknown'}
-WEEKLY_BUDGET = 5
+DEFAULT_BUDGET = 90
+WEEKLY_BUDGET = 90
+_weekly_workers = {}
+_weekly_lock = threading.Lock()
 _weekly_attempts = {}
 SCAN_SKIP = disk.ARTIFACTS | {'.git', '.cache', '.vercel', '__pycache__'}
 
@@ -190,8 +196,8 @@ def ignored_files(worktree, cfg, deadline):
             if name not in disk.ARTIFACTS:
                 continue
             candidate = os.path.join(worktree, *parts[:index+1])
-            if (os.path.isdir(candidate) and not os.path.islink(candidate) and
-                    not os.path.lexists(os.path.join(candidate, '.git')) and
+            if ((os.path.isdir(candidate) or os.path.islink(candidate)) and
+                    (os.path.islink(candidate) or not os.path.lexists(os.path.join(candidate, '.git'))) and
                     disk.deletion_evidence(candidate, cfg['workspaces']) == worktree):
                 allowed = True
                 break
@@ -282,7 +288,7 @@ def inspect(repo, entry, main, cfg, cwds, cwd_complete, deadline, days=None, onl
             reasons.append('not_merged_or_idle')
         if not reasons:
             row['category'] = 'worktrees'
-        elif (set(reasons) <= {'main_worktree', 'not_merged_or_idle'} and
+        elif (set(reasons) <= {'main_worktree', 'not_merged_or_idle', 'ignored_files', 'submodules'} and
               row['idle_days'] >= cfg['worktrees']['stale_days']):
             row['category'] = 'slim'
     except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as error:
@@ -293,6 +299,8 @@ def inspect(repo, entry, main, cfg, cwds, cwd_complete, deadline, days=None, onl
 
 def branch_rows(repo, entries, cfg, deadline):
     target = default_ref(repo, deadline)
+    merged_refs = set(git(repo, 'for-each-ref', '--format=%(refname)',
+                          '--merged='+target, 'refs/heads/', deadline=deadline).splitlines()) if target else set()
     used = {e.get('branch') for e in entries}
     rows = []
     raw = git(repo, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads/', deadline=deadline)
@@ -306,12 +314,12 @@ def branch_rows(repo, entries, cfg, deadline):
             reasons.append('protected_or_invalid_config')
         if target and ref.removeprefix('refs/heads/') == target.removeprefix('refs/remotes/origin/'):
             reasons.append('default_branch')
-        merged = ancestor(repo, head, target, deadline)
+        merged = ref in merged_refs if target else None
         if not merged:
             reasons.append('not_merged')
-        unpushed = int(git(repo, 'rev-list', '--count', head, '--not', '--remotes', deadline=deadline))
-        if unpushed:
-            reasons.append('unpushed')
+        # An ancestor of origin/HEAD is reachable from a remote ref by construction.
+        # Unmerged branches are already refused; avoid expensive per-branch queries.
+        unpushed = 0 if merged else None
         rows.append({'repo': repo, 'branch': ref.removeprefix('refs/heads/'), 'head': head,
                      'merged': merged, 'unpushed': unpushed, 'reasons': reasons,
                      'category': 'manual' if reasons else 'branches'})
@@ -329,6 +337,8 @@ class SizeCache:
             self.data = {}
 
     def measure(self, path, deadline):
+        if os.path.islink(path):
+            return os.lstat(path).st_blocks*512, True, False
         stamp = os.stat(path).st_mtime_ns
         old = self.data.get(path, {})
         # Root mtime cannot detect nested changes; expire estimates after 24 hours.
@@ -360,10 +370,11 @@ class SizeCache:
 def artifact_safe(path, worktree, cfg, deadline):
     if (path_protected(path, cfg) or
             disk.deletion_evidence(path, cfg['workspaces']) != worktree or
-            os.path.lexists(os.path.join(path, '.git'))):
+            (not os.path.islink(path) and os.path.lexists(os.path.join(path, '.git')))):
         return False
     errors = []
-    for root, dirs, files in os.walk(path, followlinks=False, onerror=errors.append):
+    walker = [] if os.path.islink(path) else os.walk(path, followlinks=False, onerror=errors.append)
+    for root, dirs, files in walker:
         remaining(deadline, 1)
         if '.git' in dirs or '.git' in files:
             return False
@@ -378,43 +389,86 @@ def artifact_safe(path, worktree, cfg, deadline):
 
 
 def artifacts(path, deadline):
-    for root, dirs, _ in os.walk(path, followlinks=False):
+    for root, dirs, files in os.walk(path, followlinks=False):
         remaining(deadline, 1)
+        candidates = list(dirs) + [f for f in files if os.path.islink(os.path.join(root, f))]
         dirs[:] = [d for d in dirs if d != '.git' and not os.path.islink(os.path.join(root, d))
                    and not os.path.lexists(os.path.join(root, d, '.git'))]
-        for name in list(dirs):
-            if name in disk.ARTIFACTS:
-                dirs.remove(name)
-                yield os.path.join(root, name)
+        for name in candidates:
+            candidate = os.path.join(root, name)
+            if name in disk.ARTIFACTS and (os.path.islink(candidate) or name in dirs):
+                if name in dirs:
+                    dirs.remove(name)
+                yield candidate
 
 
-def collect(cfg=None, budget=60, days=None, online=False, fetch=False):
+def repository_order(repos):
+    try:
+        data = json.loads((Path(history.state_dir())/'worktree-checks.json').read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    stamps = {k: v for k, v in data.items() if isinstance(v, (int, float))}
+    return sorted(repos, key=lambda pair: stamps.get(pair[0], 0)), stamps
+
+
+def save_checks(stamps):
+    name = None
+    try:
+        directory = Path(history.state_dir())
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', dir=directory, delete=False) as f:
+            name = f.name
+            json.dump(stamps, f)
+        os.replace(name, directory/'worktree-checks.json')
+    except OSError:
+        if name:
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
+
+
+def collect(cfg=None, budget=DEFAULT_BUDGET, days=None, online=False, fetch=False):
     cfg = cfg or load_config()
     deadline = time.monotonic() + budget
     result = {'items': [], 'branches': [], 'artifacts': [], 'complete': True, 'errors': []}
     cache = SizeCache()
     try:
-        repos, errors = discover(cfg['workspaces'], min(deadline, time.monotonic()+min(10, budget/3)))
+        repos, errors = discover(cfg['workspaces'], min(deadline, time.monotonic()+min(15, budget/3)))
         result['errors'].extend(errors)
         cwds, cwd_complete = process_snapshot(min(deadline, time.monotonic()+5))
         result['process_cwds_complete'] = cwd_complete
         result['complete'] &= cwd_complete
-        evidence_deadline = deadline - min(20, budget/3)
-        for repo, entries in repos:
-            if fetch:
-                git(repo, 'fetch', '--all', deadline=deadline)
-                entries = registrations(repo, deadline)
-            main = entries[0]['worktree']
-            for entry in entries:
-                row = inspect(repo, entry, main, cfg, cwds, cwd_complete,
-                              min(evidence_deadline, time.monotonic()+2), days, online)
-                result['items'].append(row)
-                if UNKNOWN_REASONS.intersection(row['reasons']):
-                    result['complete'] = False
+        evidence_deadline = deadline - min(2, budget/20)
+        repos, stamps = repository_order(repos)
+        def inspect_repo(pair):
+            repo, entries = pair
+            rows, branches, errors = [], [], []
+            started = time.monotonic() < evidence_deadline
             try:
-                result['branches'].extend(branch_rows(repo, entries, cfg, min(evidence_deadline, time.monotonic()+3)))
+                if fetch:
+                    git(repo, 'fetch', '--all', deadline=evidence_deadline)
+                    entries = registrations(repo, evidence_deadline)
+                main = entries[0]['worktree']
+                for entry in entries:
+                    rows.append(inspect(repo, entry, main, cfg, cwds, cwd_complete,
+                                        min(evidence_deadline, time.monotonic()+10), days, online))
+                branches = branch_rows(repo, entries, cfg, evidence_deadline)
             except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as error:
-                result['errors'].append({'repo': repo, 'error': str(error)})
+                errors.append({'repo': repo, 'error': str(error)})
+            return repo, rows, branches, errors, started
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            for repo, rows, branches, errors, started in pool.map(inspect_repo, repos):
+                result['items'].extend(rows)
+                result['branches'].extend(branches)
+                result['errors'].extend(errors)
+                if any(UNKNOWN_REASONS.intersection(row['reasons']) for row in rows):
+                    result['complete'] = False
+                if started:
+                    stamps[repo] = time.time()
+        save_checks(stamps)
         # Measure after inventory so expensive size scans do not hide registered worktrees.
         for row in sorted(result['items'], key=lambda r: r['category'] not in ('worktrees', 'slim')):
             if not row['exists']:
@@ -530,11 +584,13 @@ def clean(data, yes=False, include=None, days=None, online=False):
 
 def weekly_summary(notifier=None, cfg=None):
     cfg = cfg or load_config()
-    key, now = history.state_dir(), time.monotonic()
+    key, now = history.state_dir(), time.time()
     if key in _weekly_attempts and now - _weekly_attempts[key] < 7*86400:
         return None
     try:
-        if history.read(['worktree-summary'], days=7):
+        previous = history.read(['worktree-summary'], days=7)
+        if previous:
+            _weekly_attempts[key] = datetime.datetime.fromisoformat(previous[-1]['at']).timestamp()
             return None
     except OSError:
         _weekly_attempts[key] = now
@@ -550,3 +606,23 @@ def weekly_summary(notifier=None, cfg=None):
                         ('部分盘点 / Partial inventory: ' if not record['complete'] else '',
                          record['reclaimable_bytes_estimate']/1024**3, record['counts'])}], cfg=cfg)
     return record
+
+
+def schedule_weekly_summary(notifier=None, cfg=None):
+    """Start at most one daemon job; the watch loop never waits for inventory."""
+    key, now = history.state_dir(), time.time()
+    with _weekly_lock:
+        if key in _weekly_workers or (key in _weekly_attempts and now-_weekly_attempts[key] < 7*86400):
+            return False
+        def background():
+            try:
+                weekly_summary(notifier, cfg)
+            except Exception as error:
+                print(f'worktree summary failed: {error}', file=sys.stderr)
+            finally:
+                with _weekly_lock:
+                    _weekly_workers.pop(key, None)
+        worker = threading.Thread(target=background, name='worktree-summary', daemon=True)
+        _weekly_workers[key] = worker
+        worker.start()
+    return True

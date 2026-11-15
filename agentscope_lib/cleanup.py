@@ -686,7 +686,7 @@ def cmd_watch(args):
                     print(f'metrics failed: {error}', file=sys.stderr)
                 try:
                     from agentscope_lib import worktrees
-                    worktrees.weekly_summary(notifier, cfg)
+                    worktrees.schedule_weekly_summary(notifier, cfg)
                 except Exception as error:
                     print(f'worktree summary failed: {error}', file=sys.stderr)
                 if not cfg['valid']:
