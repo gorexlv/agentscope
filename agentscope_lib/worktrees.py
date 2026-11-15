@@ -15,6 +15,9 @@ from .config import load_config, protected, within
 from .lifecycle import remaining
 
 KINDS = {'worktrees', 'prune', 'branches', 'slim'}
+UNKNOWN_REASONS = {'query_failed', 'process_cwds_unknown', 'path_unknown'}
+WEEKLY_BUDGET = 5
+_weekly_attempts = {}
 SCAN_SKIP = disk.ARTIFACTS | {'.git', '.cache', '.vercel', '__pycache__'}
 
 
@@ -174,6 +177,31 @@ def activity(path, deadline):
     return latest
 
 
+def ignored_files(worktree, cfg, deadline):
+    """Only marked regenerable directories may hide untracked content."""
+    raw = git(worktree, 'ls-files', '-z', '-o', '-i', '--exclude-standard',
+              '--directory', deadline=deadline)
+    rejected, count = [], 0
+    for relative in filter(None, raw.split('\0')):
+        remaining(deadline, 1)
+        parts = Path(relative).parts
+        allowed = False
+        for index, name in enumerate(parts):
+            if name not in disk.ARTIFACTS:
+                continue
+            candidate = os.path.join(worktree, *parts[:index+1])
+            if (os.path.isdir(candidate) and not os.path.islink(candidate) and
+                    not os.path.lexists(os.path.join(candidate, '.git')) and
+                    disk.deletion_evidence(candidate, cfg['workspaces']) == worktree):
+                allowed = True
+                break
+        if not allowed:
+            count += 1
+            if len(rejected) < 5:
+                rejected.append(relative)
+    return rejected, count
+
+
 def inspect(repo, entry, main, cfg, cwds, cwd_complete, deadline, days=None, online=False):
     path = entry['worktree']
     row = {'path': path, 'repo': repo, 'head': entry.get('HEAD'),
@@ -181,7 +209,8 @@ def inspect(repo, entry, main, cfg, cwds, cwd_complete, deadline, days=None, onl
            'tool': tool_for(path), 'main': path == main, 'locked': 'locked' in entry,
            'exists': os.path.isdir(path), 'dirty': None, 'unpushed': None,
            'merged': None, 'pr_state': None, 'last_activity': None, 'idle_days': None,
-           'bytes': None, 'size_complete': False, 'reasons': [], 'category': 'manual'}
+           'bytes': None, 'size_complete': False, 'reasons': [], 'category': 'manual',
+           'ignored_paths': [], 'ignored_count': 0}
     reasons = row['reasons']
     if not cfg['valid']:
         reasons.append('invalid_config')
@@ -227,10 +256,17 @@ def inspect(repo, entry, main, cfg, cwds, cwd_complete, deadline, days=None, onl
                                 '--ignore-submodules=none', deadline=deadline))
         if row['dirty']:
             reasons.append('dirty_or_untracked')
+        row['ignored_paths'], row['ignored_count'] = ignored_files(path, cfg, deadline)
+        if row['ignored_count']:
+            reasons.append('ignored_files')
+        if os.path.lexists(os.path.join(path, '.gitmodules')):
+            reasons.append('submodules')
         row['unpushed'] = int(git(path, 'rev-list', '--count', 'HEAD', '--not', '--remotes', deadline=deadline))
         if row['unpushed']:
             reasons.append('unpushed')
         row['merged'] = ancestor(path, row['head'], default_ref(repo, deadline), deadline)
+        if not row['branch'] and row['merged'] is not True:
+            reasons.append('detached_unmerged')
         if online:
             row['pr_state'] = pr_state(repo, row['branch'], row['head'], deadline)
         last = activity(path, deadline)
@@ -322,17 +358,30 @@ class SizeCache:
 
 
 def artifact_safe(path, worktree, cfg, deadline):
-    if path_protected(path, cfg) or not disk.deletion_evidence(path, cfg['workspaces']):
+    if (path_protected(path, cfg) or
+            disk.deletion_evidence(path, cfg['workspaces']) != worktree or
+            os.path.lexists(os.path.join(path, '.git'))):
         return False
+    errors = []
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=errors.append):
+        remaining(deadline, 1)
+        if '.git' in dirs or '.git' in files:
+            return False
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+    if errors:
+        raise OSError('artifact boundary scan incomplete')
     relative = os.path.relpath(path, worktree)
     # Generated directory names are not proof that their contents are untracked.
-    return not git(worktree, 'ls-files', '-z', '--', relative, deadline=deadline)
+    return (not git(worktree, 'ls-files', '-z', '--', relative, deadline=deadline) and
+            not git(worktree, 'status', '--porcelain=v1', '--untracked-files=all',
+                    '--ignore-submodules=none', '--', relative, deadline=deadline))
 
 
 def artifacts(path, deadline):
     for root, dirs, _ in os.walk(path, followlinks=False):
         remaining(deadline, 1)
-        dirs[:] = [d for d in dirs if d != '.git' and not os.path.islink(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if d != '.git' and not os.path.islink(os.path.join(root, d))
+                   and not os.path.lexists(os.path.join(root, d, '.git'))]
         for name in list(dirs):
             if name in disk.ARTIFACTS:
                 dirs.remove(name)
@@ -349,6 +398,7 @@ def collect(cfg=None, budget=60, days=None, online=False, fetch=False):
         result['errors'].extend(errors)
         cwds, cwd_complete = process_snapshot(min(deadline, time.monotonic()+5))
         result['process_cwds_complete'] = cwd_complete
+        result['complete'] &= cwd_complete
         evidence_deadline = deadline - min(20, budget/3)
         for repo, entries in repos:
             if fetch:
@@ -359,7 +409,7 @@ def collect(cfg=None, budget=60, days=None, online=False, fetch=False):
                 row = inspect(repo, entry, main, cfg, cwds, cwd_complete,
                               min(evidence_deadline, time.monotonic()+2), days, online)
                 result['items'].append(row)
-                if 'query_failed' in row['reasons']:
+                if UNKNOWN_REASONS.intersection(row['reasons']):
                     result['complete'] = False
             try:
                 result['branches'].extend(branch_rows(repo, entries, cfg, min(evidence_deadline, time.monotonic()+3)))
@@ -392,6 +442,8 @@ def collect(cfg=None, budget=60, days=None, online=False, fetch=False):
 
 def summary(data):
     counts = {k: sum(r['category'] == k for r in data['items']) for k in ('worktrees', 'prune', 'slim', 'manual')}
+    # Unknown is a subset of manual, not an additional cleanup category.
+    counts['unknown'] = sum(bool(UNKNOWN_REASONS.intersection(r['reasons'])) for r in data['items'])
     counts['branches'] = sum(r['category'] == 'branches' for r in data['branches'])
     counts['artifacts'] = len(data['artifacts'])
     return {'worktree_count': len(data['items']), 'counts': counts,
@@ -478,16 +530,23 @@ def clean(data, yes=False, include=None, days=None, online=False):
 
 def weekly_summary(notifier=None, cfg=None):
     cfg = cfg or load_config()
+    key, now = history.state_dir(), time.monotonic()
+    if key in _weekly_attempts and now - _weekly_attempts[key] < 7*86400:
+        return None
     try:
         if history.read(['worktree-summary'], days=7):
             return None
     except OSError:
+        _weekly_attempts[key] = now
         return None
-    data = collect(cfg=cfg)
+    # Record before collection/append: failures must not retrigger every tick.
+    _weekly_attempts[key] = now
+    data = collect(cfg=cfg, budget=WEEKLY_BUDGET)
     record = dict(data['summary'], complete=data['complete'])
     history.append('worktree-summary', record)
     if notifier and cfg['notify']['enabled']:
         notifier.send([{'kind': 'WORKTREE_SUMMARY', 'msg':
-                        'Worktree reclaimable estimate: %.2f GiB (%s)' %
-                        (record['reclaimable_bytes_estimate']/1024**3, record['counts'])}], cfg=cfg)
+                        '%sWorktree reclaimable estimate: %.2f GiB (%s)' %
+                        ('部分盘点 / Partial inventory: ' if not record['complete'] else '',
+                         record['reclaimable_bytes_estimate']/1024**3, record['counts'])}], cfg=cfg)
     return record

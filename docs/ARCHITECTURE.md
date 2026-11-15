@@ -229,7 +229,15 @@ prune 复核整仓缺失条目；branch -d 前确认未 checkout、已合入默�
 slim 只选无 Git 跟踪文件的可再生目录，重新检查陈旧仓库后复用 disk.clean；保护路径同样有效。
 Orca 路径通过 CLI 删除，保留管理器元数据约束，绝不回退到直接 git remove。
 worktrees.jsonl 记录 dry-run/attempt/cleaned/skipped；审计沿用 fail-open 语义。
-watch 调用 weekly_summary，最近 7 天已有记录即跳过；汇总只读，通知种类 WORKTREE_SUMMARY 单独冷却。
+watch 调用 weekly_summary，最近 7 天已有记录即跳过；汇总不删除数据（会写大小缓存与历史），通知种类 WORKTREE_SUMMARY 单独冷却。
 
 测试以 TemporaryDirectory 下真实 Git 仓库及 worktree 验证删除、prune、branch -d、瘦身及各拒绝条件；
 进程和 Orca/gh 外部证据使用 mock。本机验收只运行报告/预演，不实际删除、不 fetch、不联网。
+
+审查修复：inspect 使用 NUL 分隔的 ls-files -o -i --exclude-standard --directory 检查 ignored 条目，
+只有 disk.ARTIFACTS 目录与同一 worktree 的项目标记证据匹配才放行；保存拒绝条目计数和前五条路径，不读文件内容。
+fresh_row 重复该检查。detached 且 merged 不为 true 时强制 manual，.gitmodules 存在时报告 submodules。
+artifacts 在遍历时剪掉具有 .git 标记的子目录；artifact_safe 要求 deletion_evidence 与所属 worktree 一致，
+并拒绝内部嵌套仓库、跟踪文件和 Git 状态改动，执行前同样复核。
+unknown 是 manual 中 query_failed/process_cwds_unknown/path_unknown 的子集，影响 complete 并进入周汇总与通知。
+weekly_summary 按状态目录在进程内记录尝试时间，读写历史或盘点失败也节流七天；单次预算降为 5 秒，限制 watch 阻塞。

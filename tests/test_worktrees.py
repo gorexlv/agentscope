@@ -256,6 +256,13 @@ class WorktreeTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(notifier.send.call_args.args[0][0]['kind'], 'WORKTREE_SUMMARY')
 
+    def test_weekly_collection_failure_is_throttled(self):
+        with patch.object(w, 'collect', side_effect=OSError('scan failed')) as collect:
+            with self.assertRaises(OSError):
+                w.weekly_summary()
+            self.assertIsNone(w.weekly_summary())
+        self.assertEqual(collect.call_count, 1)
+
     def test_remote_url_strips_credentials(self):
         self.assertEqual(w.remote_slug('https://user:secret@github.com/owner/repo.git'), 'github.com/owner/repo')
         self.assertEqual(w.remote_slug('git@github.com:owner/repo.git'), 'github.com/owner/repo')
@@ -272,6 +279,158 @@ class WorktreeTests(unittest.TestCase):
         result = w.clean(before, yes=True, include={'worktrees'})
         self.assertEqual(result['outcomes'][0]['result'], 'skipped')
         self.assertTrue(self.link.exists())
+
+    def ignore(self, pattern):
+        with (self.repo/'.git/info/exclude').open('a') as f:
+            f.write(pattern+'\n')
+
+    def test_ignored_private_files_and_revalidation(self):
+        self.ignore('.env*')
+        before = self.report()
+        (self.link/'.env.local').write_text('private local settings')
+        row = self.row()
+        self.assertEqual(row['category'], 'manual')
+        self.assertIn('ignored_files', row['reasons'])
+        self.assertEqual(row['ignored_paths'], ['.env.local'])
+        result = w.clean(before, yes=True, include={'worktrees'})
+        self.assertEqual(result['outcomes'][0]['result'], 'skipped')
+        self.assertTrue((self.link/'.env.local').exists())
+
+    def test_ignored_artifact_needs_marker(self):
+        target = self.link/'node_modules'
+        target.mkdir()
+        (target/'generated').write_text('dependency')
+        self.assertEqual(self.row()['category'], 'worktrees')
+        (self.link/'package.json').unlink()
+        self.assertIn('ignored_files', self.row()['reasons'])
+
+    def test_ignored_marked_artifact_can_be_removed(self):
+        target = self.link/'node_modules'
+        target.mkdir()
+        (target/'generated').write_text('dependency')
+        result = w.clean(self.report(), yes=True, include={'worktrees'})
+        self.assertEqual(result['outcomes'][0]['result'], 'cleaned')
+        self.assertFalse(self.link.exists())
+
+    def test_artifact_containing_nested_repository_is_refused(self):
+        target = self.repo/'node_modules'
+        target.mkdir()
+        inner = target/'local'
+        inner.mkdir()
+        self.g('init', '-b', 'main', repo=inner)
+        self.assertFalse(w.artifact_safe(str(target), str(self.repo), config.load_config(), time.monotonic()+5))
+
+    def test_ignored_paths_sample_is_bounded(self):
+        self.ignore('*.local')
+        for i in range(8):
+            (self.link/(str(i)+'.local')).write_text('local')
+        row = self.row()
+        self.assertEqual(row['ignored_count'], 8)
+        self.assertEqual(len(row['ignored_paths']), 5)
+
+    def test_slim_nested_worktree_and_repository_boundaries(self):
+        self.ignore('wt/')
+        self.ignore('nested/')
+        nested = self.repo/'wt'
+        self.g('worktree', 'add', '-b', 'nested', str(nested))
+        (nested/'build').mkdir()
+        important = nested/'build/keep.js'
+        important.write_text('tracked')
+        self.g('add', 'build', repo=nested)
+        self.g('commit', '-m', 'keep nested source', repo=nested)
+        important.write_text('modified local source')
+        other = self.repo/'nested'
+        other.mkdir()
+        self.g('init', '-b', 'main', repo=other)
+        (other/'build').mkdir()
+        (other/'package.json').write_text('{}')
+        (other/'build/local.js').write_text('local')
+        self.assertEqual(list(w.artifacts(str(self.repo), time.monotonic()+5)), [])
+        cfg = config.load_config()
+        self.assertFalse(w.artifact_safe(str(nested/'build'), str(self.repo), cfg, time.monotonic()+5))
+        self.assertFalse(w.artifact_safe(str(nested/'build'), str(nested), cfg, time.monotonic()+5))
+        self.assertFalse(w.artifact_safe(str(other/'build'), str(other), cfg, time.monotonic()+5))
+        # Force the parent classification only to exercise artifact enumeration independently of B1.
+        real_inspect = w.inspect
+        def parent_slim(*args, **kwargs):
+            row = real_inspect(*args, **kwargs)
+            if row['path'] == str(self.repo):
+                row['category'] = 'slim'
+            return row
+        with patch.object(w, 'inspect', side_effect=parent_slim):
+            data = self.report()
+        self.assertEqual(data['artifacts'], [])
+        self.assertEqual(important.read_text(), 'modified local source')
+
+    def test_detached_unmerged_is_never_idle_eligible(self):
+        self.g('checkout', '--detach', repo=self.link)
+        self.assertEqual(self.row()['category'], 'worktrees')
+        (self.link/'file').write_text('detached change')
+        self.g('commit', '-am', 'detached', repo=self.link)
+        self.g('update-ref', 'refs/remotes/origin/old', 'HEAD', repo=self.link)
+        data = w.collect(budget=10, days=0)
+        row = next(r for r in data['items'] if r['path'] == str(self.link))
+        self.assertEqual(row['unpushed'], 0)
+        self.assertIn('detached_unmerged', row['reasons'])
+        self.assertEqual(row['category'], 'manual')
+
+    def test_default_ref_missing_and_branch_reasons(self):
+        data = self.report()
+        branches = {r['branch']: r for r in data['branches']}
+        self.assertIn('default_branch', branches['main']['reasons'])
+        self.assertIn('checked_out', branches['topic']['reasons'])
+        self.g('symbolic-ref', '--delete', 'refs/remotes/origin/HEAD')
+        row = self.row()
+        self.assertIsNone(row['merged'])
+        self.assertEqual(row['category'], 'manual')
+        data = w.collect(budget=10, days=0)
+        self.assertEqual(next(r for r in data['items'] if r['path'] == str(self.link))['category'], 'worktrees')
+        self.assertTrue(all(r['category'] == 'manual' for r in data['branches']))
+        self.g('checkout', '--detach', repo=self.link)
+        self.assertIn('detached_unmerged', self.row()['reasons'])
+
+    def test_git_failure_unknown_and_path_unknown(self):
+        real_git = w.git
+        def fail_status(repo, *args, **kwargs):
+            if args[0] == 'status':
+                raise ValueError('status unavailable')
+            return real_git(repo, *args, **kwargs)
+        with patch.object(w, 'git', side_effect=fail_status):
+            data = self.report()
+        self.assertEqual(data['summary']['counts']['unknown'], 2)
+        self.assertFalse(data['complete'])
+        self.assertTrue(all('query_failed' in r['reasons'] for r in data['items']))
+        entries = w.registrations(self.repo)
+        entry = next(e for e in entries if e['worktree'] == str(self.link))
+        with patch.object(w.os.path, 'isdir', return_value=False), patch.object(w.os.path, 'lexists', return_value=False), patch.object(w.os, 'lstat', side_effect=PermissionError('unreadable')):
+            row = w.inspect(str(self.repo), entry, str(self.repo), config.load_config(), [], True, time.monotonic()+5)
+        self.assertIn('path_unknown', row['reasons'])
+        self.assertEqual(row['category'], 'manual')
+
+    def test_submodule_is_manual(self):
+        sub = self.root/'submodule'
+        subprocess.run(['git', 'clone', str(self.repo), str(sub)], check=True, capture_output=True)
+        self.g('-c', 'protocol.file.allow=always', 'submodule', 'add', str(sub), 'vendor', repo=self.link)
+        self.g('commit', '-am', 'add submodule', repo=self.link)
+        self.g('update-ref', 'refs/remotes/origin/main', 'HEAD', repo=self.link)
+        row = self.row()
+        self.assertIn('submodules', row['reasons'])
+        self.assertEqual(row['category'], 'manual')
+
+    def test_weekly_failed_audit_throttles_and_marks_partial(self):
+        from unittest.mock import Mock
+        cfg = config.load_config()
+        cfg['notify']['enabled'] = True
+        data = self.report()
+        data['complete'] = False
+        notifier = Mock()
+        with patch.object(w, 'collect', return_value=data) as collect, patch.object(w.history, 'append', return_value=False):
+            record = w.weekly_summary(notifier, cfg)
+            self.assertIsNone(w.weekly_summary(notifier, cfg))
+        collect.assert_called_once_with(cfg=cfg, budget=5)
+        self.assertFalse(record['complete'])
+        self.assertIn('unknown', record['counts'])
+        self.assertIn('部分盘点', notifier.send.call_args.args[0][0]['msg'])
 
     def test_no_implicit_network(self):
         real_run = w.run

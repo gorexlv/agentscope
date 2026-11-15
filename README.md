@@ -417,7 +417,7 @@ agentscope worktrees clean --include worktrees,prune,branches,slim --yes
 现有 protect.cwd 规则同样生效。最后活动取源码目录/文件 mtime 与 worktree HEAD reflog mtime 的较新值，
 不扫描依赖及 Git 对象内部；这是保守的本地活动估计，并非完整会话历史。
 
-删除 worktree 必须同时满足：非主目录、存在、干净（含未跟踪文件）、无本地未推送提交、
+删除 worktree 必须同时满足：非主目录、存在、干净（含未跟踪文件及下述 ignored 检查）、无本地未推送提交、
 已合入 origin 默认分支或对应 HEAD 的 PR 已合并/关闭或达到空闲阈值、无进程使用、未锁定、不受保护。
 默认分支来自本地 origin/HEAD；不存在时合入状态为未知，不猜测 main/master，也不隐式联网。
 未推送按 HEAD 不属于任何远端引用的提交数计算；远端引用可能过期，可自行显式 fetch。
@@ -430,3 +430,14 @@ prune 是整仓操作，因此会重新检查该仓库所有缺失登记，任�
 每个候选在执行前重新查询与检查，结果写 worktrees.jsonl；瘦身另有 kills.jsonl 的 disk 审计。
 进程启动、文件修改与删除之间仍有非原子窗口，清理前应停止相关任务；任何复核拒绝都会保留目标。
 watch 每 7 天盘点并写 worktree-summary.jsonl，通知开启时提醒估计回收量，绝不会自动删除目录或分支。
+
+审查补充：被 Git 忽略的文件也需要保护。仅放行 node_modules、.venv、dist、build、.next、target
+目录里的忽略内容，而且目录必须有匹配的项目标记文件；不扩大到任意 cache 或同名目录。
+其余 ignored 内容（例如 .env、本地文档）一律归 manual，reasons 包含 ignored_files，
+ignored_paths 展示最多五条路径，ignored_count 为 Git 返回的拒绝条目数（忽略目录可能合并成一条）。
+执行前重复检查，不提供强删开关。包含子模块的 worktree 也归 manual。
+Detached HEAD 只有确认合入默认分支才能删除；空闲、远端跟踪引用或 PR 状态都不能替代合入证据。
+瘦身不会穿过嵌套仓库/worktree，生成目录内部包含仓库、被跟踪或有 Git 状态改动时同样拒绝。
+summary.counts.unknown 单列证据不全的数量，是 manual 的子集；不能与其他档相加。
+每周汇总包含 unknown 与 complete，通知在不完整时注明“部分盘点”，回收量不能当作精确趋势。
+watch 内的周盘点采用 5 秒预算，并在进程内记录尝试时间；即使审计写失败，也不会在七天内逐轮重试。
