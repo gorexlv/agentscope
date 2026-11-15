@@ -389,3 +389,44 @@ target 要求 Cargo.toml 或 pom.xml，build 也接受 build.gradle/build.gradle
 包装进程被终止后，子命令持有的 fd 会让锁保持到子命令退出；若子命令主动关闭所有非标准 fd，这种保证不再成立。
 排队是轮询竞争，不保证 FIFO；子命令退出或异常时 fd 关闭并释放锁，不删除锁文件。
 Claude Code 也可能把凭据存放在 macOS Keychain，doctor 的 missing 只代表未找到本地凭据文件，不代表未登录。
+
+### Worktree 与陈旧仓库回收
+
+```sh
+agentscope worktrees --json
+agentscope worktrees --online              # 显式通过 gh 查询 PR
+agentscope worktrees --fetch               # 显式刷新远端引用
+agentscope worktrees clean                 # 默认仅预演
+agentscope worktrees clean --include worktrees,prune,branches,slim --yes
+```
+
+默认从配置工作区（包括 ~/orca/workspaces、~/.codex/worktrees、~/multica_workspaces*）
+发现 Git 仓库，再以 `git worktree list --porcelain -z` 盘点所有登记路径，包括根之外的 linked worktree。
+输出 items、branches、artifacts 和 summary；category 为 worktrees（可删）、slim（只瘦身）、manual（需人工）、prune（失效登记）。
+本地分支另列 branches。每项 reasons 给出拒绝原因，未知进程 cwd 或 Git 查询失败均拒绝删除。
+总预算 60 秒（预留约三分之一测量大小）；超时 `complete=false`，大小不完整会标 `size_complete=false`，不要把部分盘点理解成全机总量。
+路径和根目录 mtime 对应的大小缓存保留最多 24 小时，`size_cached=true` 表示估计值，嵌套文件变化可能尚未反映。
+
+配置文件可增加：
+
+```json
+{"worktrees": {"idle_days": 30, "stale_days": 60, "protect": ["~/Projects/keep"]}}
+```
+
+`--days N` 临时覆盖 idle_days；protect 为路径及其子树，包含保护路径的祖先 worktree 也不会删除。
+现有 protect.cwd 规则同样生效。最后活动取源码目录/文件 mtime 与 worktree HEAD reflog mtime 的较新值，
+不扫描依赖及 Git 对象内部；这是保守的本地活动估计，并非完整会话历史。
+
+删除 worktree 必须同时满足：非主目录、存在、干净（含未跟踪文件）、无本地未推送提交、
+已合入 origin 默认分支或对应 HEAD 的 PR 已合并/关闭或达到空闲阈值、无进程使用、未锁定、不受保护。
+默认分支来自本地 origin/HEAD；不存在时合入状态为未知，不猜测 main/master，也不隐式联网。
+未推送按 HEAD 不属于任何远端引用的提交数计算；远端引用可能过期，可自行显式 fetch。
+Squash 合并只能用 --online 的 PR 证据补充。Orca 路径调用 `orca worktree rm`，没有 Orca CLI 则需人工。
+只使用普通 `git worktree remove`、`git worktree prune` 和 `git branch -d`，不用 force、-D 或删除远端分支。
+prune 是整仓操作，因此会重新检查该仓库所有缺失登记，任一个锁定或受保护都拒绝该仓 prune。
+
+陈旧主仓库可以只瘦身，仍要求无改动、无未推送提交和无进程使用；仅选择项目标记匹配、
+没有 Git 跟踪内容的生成目录，实际删除复用 disk.clean 的进程及目录身份检查。
+每个候选在执行前重新查询与检查，结果写 worktrees.jsonl；瘦身另有 kills.jsonl 的 disk 审计。
+进程启动、文件修改与删除之间仍有非原子窗口，清理前应停止相关任务；任何复核拒绝都会保留目标。
+watch 每 7 天盘点并写 worktree-summary.jsonl，通知开启时提醒估计回收量，绝不会自动删除目录或分支。

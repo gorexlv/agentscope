@@ -44,7 +44,7 @@ def read(kinds, days=None):
 
 
 def cmd_history(args):
-    rows = read(['kills'] if args.kills else ['sessions'] if args.sessions else ['kills', 'sessions'], args.days)
+    rows = read(['kills'] if args.kills else ['sessions'] if args.sessions else ['kills', 'sessions', 'worktrees', 'worktree-summary'], args.days)
     if args.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
     else:

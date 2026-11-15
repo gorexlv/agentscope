@@ -210,3 +210,26 @@ pbi_comm   @48  (16 bytes)   pbi_name @64 (32 bytes)
 工作区路径与目录名本身不再构成删除授权。heavy 默认 300 秒排队预算、15 秒状态提示，
 用 pass_fds 将 flock fd 交给子进程，嵌套调用用 AGENTSCOPE_HEAVY_HELD 避免重复排队。
 真实测试覆盖包装进程退出后子进程仍持锁，子进程退出后释放；轮询不提供 FIFO 保证。
+
+## Worktree 回收
+
+`worktrees.py` 分离发现、证据检查、大小估计、执行四阶段。发现遍历配置根，跳过 Git 对象、生成目录及 symlink，
+使用 NUL 分隔的 Git porcelain 解析注册；跨根登记仍盘点，主路径由首条记录确定。
+所有 Git 命令带 --no-optional-locks，子进程 timeout 服从总预算；默认离线，显式 --online/--fetch 才调用 gh/fetch。
+配置 worktrees.idle_days/stale_days/protect 由 config.py 校验，非法设置禁止清理。
+
+安全分类保留所有 reasons：主目录、锁定、保护、路径别名、进程未知/在用、Orca 缺失、脏/未跟踪、未推送及合入/空闲条件。
+PR 必须匹配当前 HEAD，避免复用分支名造成误删；origin/HEAD 缺失意味着合入未知。
+进程 cwd 用 procstat 批量采集，当前用户任一进程 cwd 不可读则保守拒绝。
+大小后置采集，状态目录 worktree-sizes.json 原子替换，按路径 + 根 mtime 命中且最多缓存 24 小时；
+缓存和审计失败不使报告崩溃。大小只是估计，不参与删除授权。
+
+执行依类别重新读取注册、HEAD/branch、Git 状态与进程证据，未达到同类资格则 skipped。
+prune 复核整仓缺失条目；branch -d 前确认未 checkout、已合入默认分支、无未推送且 OID 未变。
+slim 只选无 Git 跟踪文件的可再生目录，重新检查陈旧仓库后复用 disk.clean；保护路径同样有效。
+Orca 路径通过 CLI 删除，保留管理器元数据约束，绝不回退到直接 git remove。
+worktrees.jsonl 记录 dry-run/attempt/cleaned/skipped；审计沿用 fail-open 语义。
+watch 调用 weekly_summary，最近 7 天已有记录即跳过；汇总只读，通知种类 WORKTREE_SUMMARY 单独冷却。
+
+测试以 TemporaryDirectory 下真实 Git 仓库及 worktree 验证删除、prune、branch -d、瘦身及各拒绝条件；
+进程和 Orca/gh 外部证据使用 mock。本机验收只运行报告/预演，不实际删除、不 fetch、不联网。

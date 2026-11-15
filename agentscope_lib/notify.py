@@ -16,7 +16,7 @@ class Notifier:
         cooldown = cfg['cooldown_minutes'] * 60
         self.sent = {k: t for k, t in self.sent.items() if now - t < cooldown}
         for alert in alerts:
-            if alert['kind'] not in ('CONTEXT_LOW', 'MEM_HIGH', 'WATCH_CLEANED'):
+            if alert['kind'] not in ('CONTEXT_LOW', 'MEM_HIGH', 'WATCH_CLEANED', 'WORKTREE_SUMMARY'):
                 continue
             key = (alert.get('pid'), alert['kind'])
             if key in self.sent:
