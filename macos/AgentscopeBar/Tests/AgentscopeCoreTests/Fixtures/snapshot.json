@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "generated_at": "2026-11-16T10:00:00+08:00",
+  "daemon": {"pid": 123, "version": "x.y.z", "interval_s": 120, "last_clean_at": "…|null"},
+  "host": {"load1": 2.1, "load5": 2.4, "load15": 2.0, "ncpu": 12, "mem_used_pct": 61.5, "swap_used_gb": 1.2},
+  "sessions": [{"pid": 1, "agent": "claude", "model": "…", "cwd": "…", "branch": "…", "state": "working|waiting|idle|stuck|unknown", "cpu_pct": 3.2, "mem_mb": 410, "context_pct": 64, "cost_usd": 0.42}],
+  "totals": {"sessions": 5, "cost_usd": 3.1, "tokens": 120000},
+  "alerts": [{"level": "warn|info", "kind": "CONTEXT_LOW|MEM_HIGH|IDLE|…", "pid": 1, "msg": "…"}],
+  "orphans": {"groups": 2, "processes": 9},
+  "reclaim": {"worktrees_gb": 8.3, "removable": 47, "updated_at": "…|null"}
+}

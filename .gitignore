@@ -17,3 +17,8 @@ venv/
 .watchdog/
 state/
 *.bak.agentscope.*
+
+# Swift / menu bar app
+macos/build/
+macos/AgentscopeBar/.build/
+macos/AgentscopeBar/.swiftpm/
