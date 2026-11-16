@@ -448,3 +448,23 @@ watch 内的周盘点在后台守护线程中执行，采用 90 秒预算，主�
 本地分支用 for-each-ref --merged 批量判断；已合入分支必然有远端可达证据，未合入分支的 unpushed 留空且拒绝删除。
 主仓库中的 .env 等 ignored 内容不阻断瘦身，它们始终保留；只有明确产物候选能被删。
 符号链接产物只计链接自身的磁盘大小，显式清理也只 unlink；即使目标位于工作区外，目标内容不会被遍历或删除。
+
+## daemon 快照与 socket
+
+`agentscope watch` 每轮生成 `snapshot.json`，并在后台提供 `agentscope.sock`。
+两者位于 `$AGENTSCOPE_STATE_DIR`（默认 `~/.local/state/agentscope`），权限均为 `0600`。
+快照通过临时文件加原子替换发布；socket 故障不会中断巡检。
+
+```sh
+bin/agentscope snapshot --json
+bin/agentscope snapshot
+```
+
+`snapshot` 按需采集并写入一次快照，不启动 daemon，也不清理进程。
+JSON schema 1 包含 daemon、主机负载、会话状态、成本/token 汇总、告警、孤儿组和可回收空间。
+可回收空间只读取已有 worktree 周报缓存；没有缓存时返回未知值，不触发全量扫描。
+
+socket 使用每连接一行 JSON 请求、一行 JSON 响应，I/O 超时 5 秒。
+支持 `ping`、`snapshot` 和两阶段 `clean`：先发送 `{"op":"clean","dry_run":true}`
+取得目标和 token，再显式发送 `{"op":"clean","dry_run":false,"token":"…"}`。
+token 在 60 秒后过期且只可使用一次，执行时复核目标身份和清理条件；审计记录使用 `mode=socket`。

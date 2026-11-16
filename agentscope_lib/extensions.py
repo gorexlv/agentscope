@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import sys
 from . import agents, disk, doctor, heavy, mcp, metrics, ports
 
 
@@ -57,6 +58,27 @@ def cmd_worktrees(args):
     return 1 if any(r['result'] == 'skipped' for r in data.get('outcomes', [])) else 0
 
 
+def cmd_snapshot(args):
+    """生成一次快照（菜单栏 App 的数据源之一）。"""
+    from . import snapshot as snapshot_mod
+    from . import server as server_mod
+    daemon = None
+    live = server_mod.request({'op': 'snapshot'})
+    if live and live.get('ok'):
+        daemon = live.get('snapshot', {}).get('daemon')
+    data = snapshot_mod.build_snapshot(daemon=daemon)
+    try:
+        snapshot_mod.write_snapshot(data)
+    except OSError as error:
+        print(f'agentscope: snapshot write failed: {error}', file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(snapshot_mod.render(data))
+    return 0
+
+
 def register(sub):
     p = sub.add_parser('worktrees', help='Bounded worktree inventory and explicit maintenance')
     p.add_argument('action', nargs='?', choices=['clean'])
@@ -68,6 +90,9 @@ def register(sub):
     p.add_argument('--yes', action='store_true')
     p.add_argument('--include', default='worktrees,prune,branches,slim')
     p.set_defaults(func=cmd_worktrees)
+    p = sub.add_parser('snapshot',help='生成一次守护快照（菜单栏数据源）')
+    p.add_argument('--json',action='store_true')
+    p.set_defaults(func=cmd_snapshot)
     p = sub.add_parser('mcp',help='MCP instances grouped by server name')
     p.add_argument('--json',action='store_true')
     p.add_argument('--fast',action='store_true')

@@ -250,3 +250,24 @@ branch_rows 用一次 for-each-ref --merged 查合入集合；未合入分支本
 生成目录符号链接使用 lstat 计量和身份核对，disk.clean 额外验证 ignored/untracked 后只调用 unlink，绝不 rmtree 目标。
 纯缓存只扩展四类 Python 目录名，项目标记可沿同一 worktree 的祖先查找；不接受任意 CACHEDIR.TAG 或独立缓存文件。
 slim 可容忍 ignored_files/submodules 理由，具体 artifact 仍不能越过仓库边界或含跟踪/改动文件，fresh_row 保持执行前完整复核。
+
+## daemon 快照与 socket
+
+`cleanup.cmd_watch` 启动 `server.SnapshotServer` 后继续独立巡检，退出时关闭服务。
+`watch_round` 复用本轮进程分析和已采集的会话，交给 `snapshot.build_snapshot` 组装 schema 1；
+`snapshot.write_snapshot` 在同目录创建临时文件、flush/fsync，再以 `os.replace` 发布 `0600` 文件。
+会话与告警来自 `agents`，活动状态沿用 `activity`，负载复用 `cli.system_load`。
+可回收估算只读取 `worktree-summary` 历史缓存并保留采集时间；单纯体积缓存不能证明可删除。
+快照和服务启动异常被隔离，巡检仍继续；CLI `snapshot [--json]` 可独立生成快照。
+
+状态目录由 `AGENTSCOPE_STATE_DIR` 指定，默认 `~/.local/state/agentscope`。
+Unix socket 使用独立连接线程，单连接仅处理一个换行结尾的 JSON 对象，请求上限 64 KiB，
+读请求使用 5 秒总预算，默认分析和清理共享剩余截止时间；socket I/O 超时为 5 秒。
+服务用文件锁避免重复启动，仅替换本用户已失效的 socket，拒绝覆盖普通文件或活跃端点；
+绑定发生在私有临时目录内，先设置 `0600` 再原子发布。退出仅移除自身端点。
+
+`ping` 返回版本；`snapshot` 返回最近一轮内存快照，避免请求中重复全量扫描。
+`clean` 必须显式提供布尔 `dry_run`。预览保存目标完整身份的独立副本，返回不透明随机 token；
+执行在锁内一次性消费 token（单调时钟 60 秒过期），只遍历 token 保存的组。
+`kill_group(expected=…, mode='socket')` 再次检查 cleanable、根进程和成员启动时间，沿用逐成员终止及审计。
+清理截止时间耗尽时保守跳过或报告 remaining，不扩大授权目标，也不因客户端重试再次消费 token。

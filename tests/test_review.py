@@ -75,14 +75,16 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(history.read(['kills'])[0]['reason'], 'invalid config')
         self.assertIsNotNone(sessions.pricing_for('gpt-5'))
 
+    @patch('agentscope_lib.cleanup.write_daemon_snapshot')
     @patch('agentscope_lib.worktrees.schedule_weekly_summary')
-    def test_watch_disabled_notifications_and_round_recovery(self, weekly):
+    def test_watch_disabled_notifications_and_round_recovery(self, weekly, snapshot):
         from agentscope_lib import agents
         import types
         with patch.object(cleanup, 'analyze', side_effect=[OSError('transient'), ({}, [])]) as analyze, patch.object(agents, 'collect') as collect, patch.object(cleanup.time, 'sleep', side_effect=[None, KeyboardInterrupt]):
             self.assertEqual(cleanup.cmd_watch(types.SimpleNamespace(interval=1, dry_run=True)), 0)
             self.assertEqual(analyze.call_count, 2)
             collect.assert_not_called()
+            snapshot.assert_called_once()
 
     @patch('agentscope_lib.worktrees.schedule_weekly_summary')
     def test_watch_notification_failure_isolated(self, weekly):

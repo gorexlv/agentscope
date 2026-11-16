@@ -23,6 +23,7 @@ agentscope — 本地 AI Agent 会话与后台进程监控/清理工具
 
 import argparse
 import collections
+import datetime
 import json
 import os
 import signal
@@ -542,6 +543,7 @@ def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
         outcome['result'] = result
         if reason:
             record['reason'] = reason
+            outcome['reason'] = reason
         audit('kills', dict(record, result=result))
         return result in ('cleaned', 'gone', 'dry-run')
     if not cfg['valid']:
@@ -669,52 +671,104 @@ def cmd_clean(args):
     return 0 if ok == len(targets) else 1
 
 
+def write_daemon_snapshot(info, units, state, sessions=None):
+    """写快照 —— 失败绝不影响巡检。"""
+    try:
+        from agentscope_lib import snapshot as snapshot_mod
+        data = snapshot_mod.build_snapshot(daemon=state.get('daemon'), info=info,
+                                            units=units, sessions=sessions)
+        snapshot_mod.write_snapshot(data)
+        state['snapshot'] = data
+        return data
+    except Exception as error:
+        print(f'快照写入失败，将继续巡检: {error}', file=sys.stderr)
+        return None
+
+
+def watch_round(args, notifier, seen, state):
+    """一轮巡检：分析 → 指标 → 清理 → 写快照。外围采集故障不影响清理。"""
+    cfg = load_config()
+    info, units = analyze(cfg=cfg)
+    expire_seen(seen, units)
+    try:
+        from agentscope_lib import metrics
+        metrics.write(metrics.sample(info, units))
+    except Exception as error:
+        print(f'metrics failed: {error}', file=sys.stderr)
+    try:
+        from agentscope_lib import worktrees
+        worktrees.schedule_weekly_summary(notifier, cfg)
+    except Exception as error:
+        print(f'worktree summary failed: {error}', file=sys.stderr)
+    if not cfg['valid']:
+        audit('kills', {'mode': 'watch', 'pgid': None, 'members': [], 'result': 'skipped', 'reason': 'invalid config'})
+    sessions = None
+    if cfg['notify']['enabled']:
+        try:
+            from agentscope_lib import agents as agents_mod
+            sessions = agents_mod.collect()
+            notifier.send(agents_mod.alerts(sessions), cfg=cfg)
+        except Exception as error:
+            print(f'告警采集失败: {error}', file=sys.stderr)
+    for g in units:
+        if not cleanable(g, info, cfg=cfg) or group_key(g) in seen:
+            continue
+        outcome = {}
+        ok = kill_group(g['pgid'], dry_run=args.dry_run, mode='watch', expected=g, outcome=outcome)
+        if ok:
+            seen.add(group_key(g))
+        if outcome.get('result') == 'cleaned' and not args.dry_run:
+            state['daemon']['last_clean_at'] = datetime.datetime.now().astimezone().isoformat()
+            try:
+                notifier.send([{'pid': g['pgid'], 'kind': 'WATCH_CLEANED', 'msg': f"已清理 pgid {g['pgid']}"}], cfg=cfg)
+            except Exception as error:
+                print(f'通知失败: {error}', file=sys.stderr)
+        print(f"pgid {g['pgid']}: {outcome.get('result', 'skipped')}")
+    write_daemon_snapshot(info, units, state, sessions=sessions)
+    return state
+
+
 def cmd_watch(args):
     """Run independent rounds; notification/audit failures must not stop cleanup."""
     print(f'agentscope v{VERSION} — 守护模式，每 {args.interval}s 扫描')
     notifier, seen = Notifier(), set()
+    state = {'daemon': {'pid': os.getpid(), 'version': VERSION,
+                        'interval_s': args.interval, 'last_clean_at': None},
+             'snapshot': None}
+    server = None
+    try:
+        from agentscope_lib import server as server_mod
+
+        def _provider():
+            # 优先给最近一轮的快照，避免每个连接都重扫一遍机器。
+            if state['snapshot']:
+                return state['snapshot']
+            from agentscope_lib import snapshot as snapshot_mod
+            return snapshot_mod.build_snapshot(sessions=[], info={}, units=[], alerts=[],
+                                               load={}, daemon=state['daemon'])
+
+        server = server_mod.SnapshotServer(daemon_info=state['daemon'],
+                                           snapshot_provider=_provider)
+        server.start()
+        print(f'本地 socket: {server.path}')
+    except Exception as error:
+        print(f'socket 服务启动失败，继续巡检: {error}', file=sys.stderr)
+        server = None
     try:
         while True:
             try:
-                cfg = load_config()
-                info, units = analyze(cfg=cfg)
-                expire_seen(seen, units)
-                try:
-                    from agentscope_lib import metrics
-                    metrics.write(metrics.sample(info, units))
-                except Exception as error:
-                    print(f'metrics failed: {error}', file=sys.stderr)
-                try:
-                    from agentscope_lib import worktrees
-                    worktrees.schedule_weekly_summary(notifier, cfg)
-                except Exception as error:
-                    print(f'worktree summary failed: {error}', file=sys.stderr)
-                if not cfg['valid']:
-                    audit('kills', {'mode': 'watch', 'pgid': None, 'members': [], 'result': 'skipped', 'reason': 'invalid config'})
-                if cfg['notify']['enabled']:
-                    try:
-                        from agentscope_lib import agents as agents_mod
-                        notifier.send(agents_mod.alerts(agents_mod.collect()), cfg=cfg)
-                    except Exception as error:
-                        print(f'告警采集失败: {error}', file=sys.stderr)
-                for g in units:
-                    if not cleanable(g, info, cfg=cfg) or group_key(g) in seen:
-                        continue
-                    outcome = {}
-                    ok = kill_group(g['pgid'], dry_run=args.dry_run, mode='watch', expected=g, outcome=outcome)
-                    if ok:
-                        seen.add(group_key(g))
-                    if outcome.get('result') == 'cleaned' and not args.dry_run:
-                        try:
-                            notifier.send([{'pid': g['pgid'], 'kind': 'WATCH_CLEANED', 'msg': f"已清理 pgid {g['pgid']}"}], cfg=cfg)
-                        except Exception as error:
-                            print(f'通知失败: {error}', file=sys.stderr)
-                    print(f"pgid {g['pgid']}: {outcome.get('result', 'skipped')}")
+                watch_round(args, notifier, seen, state)
             except Exception as error:
                 print(f'巡检本轮失败，将继续: {error}', file=sys.stderr)
             time.sleep(max(.1, args.interval))
     except KeyboardInterrupt:
         print('已退出守护模式。')
+    finally:
+        if server is not None:
+            try:
+                server.stop()
+            except Exception:
+                pass
     return 0
 
 
