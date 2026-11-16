@@ -17,6 +17,7 @@ import os
 import re
 import time
 import subprocess
+import shlex
 
 from . import procstat
 from . import sessions
@@ -43,7 +44,8 @@ AGENT_PATTERNS = [
 
 # 明确不是 Agent 的进程（避免 "codex" 匹配到无关东西）
 NEGATIVE = ("claude-manager", "agentscope", "codex-code-mode-host",
-            "codex/app-server", "codex-cli-wrapper")
+            "codex/app-server", "codex-cli-wrapper",
+            "/application support/codex/", "/.codex/computer-use/")
 
 
 def detect_agent_type(path, comm):
@@ -55,7 +57,10 @@ def detect_agent_type(path, comm):
     # 更具体的 claude 特征优先
     if "claude-code" in hay or "/claude.app/" in hay:
         return "claude"
-    if "codex-cli" in hay or "/codex" in hay:
+    name = os.path.basename(path).lower()
+    if (name in ("codex", "codex.exe") or name.startswith("codex ")
+            or comm.lower().startswith("codex")
+            or (".app/contents/frameworks/codex" in path.lower() and "/helpers/" in path.lower())):
         return "codex"
     if "opencode" in hay:
         return "opencode"
@@ -151,14 +156,14 @@ def _ensure_parsed(agent_type, f):
     return f.get("data") or {}
 
 
-def _match_session(agent_type, cwd, idx, max_age=7200, claimed=(), started=None):
+def _match_session(agent_type, cwd, idx, max_age=7200, claimed=(), started=None, disambiguate=False):
     """给一个进程找对应的会话文件。
 
     Claude Code 有捷径：项目目录名就是 cwd 的 slug，可以直接定位，
     不需要读文件内容。
     """
     cands = [f for f in idx.get(agent_type, []) if f["path"] not in claimed
-             and time.time() - f.get("mtime", 0) < max_age]
+             and (not disambiguate or time.time() - f.get("mtime", 0) < max_age)]
     if not cands:
         return None
     ncwd = _norm(cwd)
@@ -281,16 +286,40 @@ def collect(home=None, with_resources=True, context_limit=None):
         return pid
     for pid, _, _ in agent_list:
         roots[pid] = root_for(pid)
+    def background_service(pid):
+        return _is_app_server(procs[pid]) and cwds.get(pid) in (None, "", "/")
+
+    # Only multiple independent roots sharing a cwd need the stale-log guard.
+    peers = {}
+    for root in set(roots.values()):
+        if _is_session_main(procs[root]) and not background_service(root):
+            key = (agent_types[root], os.path.realpath(cwds.get(root) or "/"))
+            peers[key] = peers.get(key, 0) + 1
     matches, claimed = {}, set()
     for pid, at, _ in sorted(agent_list, key=lambda item: (procs[roots[item[0]]].get("start_time", 0), item[0])):
         root = roots[pid]
         if root not in matches:
-            matches[root] = _match_session(at, cwds.get(root, ""), idx, claimed=claimed,
-                                           started=(procs[root].get("start_time", 0) / 1_000_000) or None)
-            if not _is_session_main(procs[root]):
+            if not _is_session_main(procs[root]) or background_service(root):
                 matches[root] = None
+            else:
+                key = (at, os.path.realpath(cwds.get(root) or "/"))
+                matches[root] = _match_session(at, cwds.get(root, ""), idx, claimed=claimed,
+                                               started=(procs[root].get("start_time", 0) / 1_000_000) or None,
+                                               disambiguate=peers.get(key, 0) > 1)
             if matches[root]:
                 claimed.add(matches[root]["path"])
+
+    # A logless root-directory service can be attributed by a unique containing
+    # desktop bundle. Never apply this rule to a CLI main or a matched session.
+    for pid, at, b in agent_list:
+        if (roots[pid] != pid or matches.get(pid) is not None or pid in desktop
+                or cwds.get(pid) not in (None, "", "/")
+                or (_is_session_main(b) and not _is_app_server(b))):
+            continue
+        hosts = [host for host, kind in desktop.items() if kind == at and
+                 b.get("path", "").startswith(procs[host]["path"].split(".app/")[0] + ".app/")]
+        if len(hosts) == 1:
+            roots[pid] = hosts[0]
 
     out = []
     for pid, at, b in agent_list:
@@ -313,7 +342,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             "cost": None, "git_branch": None, "title": None,
             "session_id": None, "session_path": None,
             "last_turn_ms": None, "timestamp": None,
-            "is_main": pid == roots[pid],
+            "is_main": pid == roots[pid] and _is_session_main(b) and not background_service(pid),
         }
 
         if sess:
@@ -324,7 +353,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             if not data:
                 data = _ensure_parsed(at, sess)
             # 只有会话主进程承载 token / 成本，避免同一会话被重复计费
-            rec["is_main"] = pid == roots[pid]
+            rec["is_main"] = pid == roots[pid] and _is_session_main(b) and not background_service(pid)
             if rec["is_main"]:
                 rec.update(data)
                 if at == "claude" and context_limit:
@@ -358,6 +387,18 @@ def collect(home=None, with_resources=True, context_limit=None):
     out.sort(key=lambda r: (r["agent_type"], not r["is_main"],
                              -(r.get("mem_mb") or 0)))
     return out
+
+
+def _is_app_server(process):
+    """Identify the service subcommand; cwd/log evidence determines session status."""
+    try:
+        args = shlex.split(process.get("cmdline") or "")[1:]
+    except ValueError:
+        return False
+    if "app-server" not in args:
+        return False
+    before = args[:args.index("app-server")]
+    return not any(arg in ("exec", "resume", "--resume", "-p") for arg in before)
 
 
 def _is_session_main(b):
@@ -506,17 +547,20 @@ def aggregate_sessions(records):
                 "pid:" + str(r.get("root_pid") or r.get("pid")))
     groups = {}
     for r in records:
-        # Unknown helpers remain separate rather than borrowing an unrelated session.
+        # Keep helper resources only when a known main/log anchors their group.
         key = identity(r)
         groups.setdefault(key, []).append(r)
     out = []
     projects = {}
     for key, members in groups.items():
+        if not any(r.get("is_main", True) or r.get("session_path") or r.get("session_id") for r in members):
+            continue
         main = min(members, key=lambda r: (not r.get("is_main", True),
                    r.get("pid") != r.get("root_pid", r.get("pid")), r.get("pid") or 0))
         row = dict(main)
         row.update(session_key=key[1], is_main=True,
                    processes=sum(r.get("processes", 1) for r in members),
+                   auxiliary_processes=sum(r.get("auxiliary_processes", 0 if r.get("is_main", True) else 1) for r in members),
                    pids=sorted({p for r in members for p in r.get("pids", [r.get("pid")]) if p is not None}))
         for field in ("mem_mb", "cpu_pct"):
             values = [r[field] for r in members if r.get(field) is not None]

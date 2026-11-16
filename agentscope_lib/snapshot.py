@@ -167,6 +167,7 @@ def session_rows(sessions):
             'session_key': record.get('session_key'),
             'project': record.get('project'),
             'processes': record.get('processes'),
+            'auxiliary_processes': record.get('auxiliary_processes'),
             'agent': record.get('agent_type'),
             'model': record.get('model'),
             'cwd': record.get('cwd'),

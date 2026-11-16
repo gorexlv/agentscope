@@ -77,7 +77,7 @@ class AggregationTests(unittest.TestCase):
             run.return_value.stdout = '/repo/top\n'
             self.assertEqual(agents.project_name('/repo/top/subdir'), 'top')
 
-    def test_embedded_desktop_host_and_reparented_helpers(self):
+    def test_embedded_host_does_not_list_unattributed_helpers(self):
         procs = {
             10: {'path': '/Applications/ChatGPT.app/Contents/MacOS/ChatGPT', 'comm': 'ChatGPT', 'ppid': 1},
             11: {'path': '/Applications/ChatGPT.app/Contents/Helpers/Codex Renderer', 'comm': 'Codex', 'ppid': 10},
@@ -93,7 +93,8 @@ class AggregationTests(unittest.TestCase):
              patch.object(agents.mcp, 'collect', return_value=[]), \
              patch.object(agents.activity, 'state', return_value={}):
             rows = agents.collect()
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 3)
+        self.assertNotIn(12, [r["pid"] for r in rows])
         desktop = next(r for r in rows if r['pid'] == 10)
         self.assertEqual(desktop['processes'], 2)
         self.assertEqual(desktop['mem_mb'], 200)
