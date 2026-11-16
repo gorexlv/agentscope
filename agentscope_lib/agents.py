@@ -16,6 +16,7 @@ Agent 会话聚合：把进程与会话文件关联，产出统一视图。
 import os
 import re
 import time
+import subprocess
 
 from . import procstat
 from . import sessions
@@ -149,13 +150,13 @@ def _ensure_parsed(agent_type, f):
     return f.get("data") or {}
 
 
-def _match_session(agent_type, cwd, idx, max_age=7200):
+def _match_session(agent_type, cwd, idx, max_age=7200, claimed=()):
     """给一个进程找对应的会话文件。
 
     Claude Code 有捷径：项目目录名就是 cwd 的 slug，可以直接定位，
     不需要读文件内容。
     """
-    cands = idx.get(agent_type) or []
+    cands = [f for f in idx.get(agent_type, []) if f["path"] not in claimed]
     if not cands:
         return None
     ncwd = _norm(cwd)
@@ -204,10 +205,6 @@ def _match_session(agent_type, cwd, idx, max_age=7200):
     # 3. 兜底：最近的已解析候选
     if best is not None:
         return best
-    fresh = [f for f in parsed if now - f["mtime"] < max_age]
-    if fresh:
-        fresh.sort(key=lambda x: -x["mtime"])
-        return fresh[0]
     return None
 
 
@@ -231,6 +228,22 @@ def collect(home=None, with_resources=True, context_limit=None):
             continue
         agent_list.append((pid, at, b))
 
+    # Desktop hosts (notably ChatGPT embedding Codex) may not have an agent name.
+    # Discover them only through an already identified agent descendant.
+    desktop = {}
+    for pid, at, _ in list(agent_list):
+        parent, seen = procs[pid].get("ppid"), {pid}
+        while parent in procs and parent not in seen:
+            seen.add(parent)
+            path = procs[parent].get("path", "")
+            if ".app/Contents/MacOS/" in path and os.path.basename(path).lower() in ("chatgpt", "codex", "claude"):
+                desktop[parent] = at
+            parent = procs[parent].get("ppid")
+    identified = {pid for pid, _, _ in agent_list}
+    for pid, at in desktop.items():
+        if pid not in identified:
+            agent_list.append((pid, at, procs[pid]))
+
     # 用 Agent 进程的 cwd 集合来限定索引范围 —— 只解析相关目录下的会话文件
     agent_cwds = {cwds.get(pid, "") for pid, _, _ in agent_list}
     agent_cwds.discard("")
@@ -247,12 +260,39 @@ def collect(home=None, with_resources=True, context_limit=None):
     if with_resources and agent_list:
         mem_map = procstat.footprint_many([p for p, _, _ in agent_list])
 
+    # Resolve ancestry through non-agent intermediates, then match each root once.
+    agent_pids = {pid for pid, _, _ in agent_list}
+    roots = {}
+    for pid, at, _ in agent_list:
+        root, parent, seen = pid, procs[pid].get("ppid"), {pid}
+        while parent in procs and parent not in seen:
+            seen.add(parent)
+            if parent in agent_pids and (desktop.get(parent) or detect_agent_type(procs[parent].get("path", ""), procs[parent].get("comm", ""))) == at:
+                root = parent
+            parent = procs[parent].get("ppid")
+        # Reparented crash handlers can be linked by the unique desktop bundle.
+        if root == pid and not _is_session_main(procs[pid]):
+            path = procs[pid].get("path", "")
+            containers = [p for p, kind in desktop.items() if kind == at and
+                          path.startswith(procs[p].get("path", "").split(".app/")[0] + ".app/")]
+            if len(containers) == 1:
+                root = containers[0]
+        roots[pid] = root
+    matches, claimed = {}, set()
+    for pid, at, _ in agent_list:
+        root = roots[pid]
+        if root not in matches:
+            matches[root] = _match_session(at, cwds.get(root, ""), idx, claimed=claimed)
+            if matches[root]:
+                claimed.add(matches[root]["path"])
+
     out = []
     for pid, at, b in agent_list:
-        cwd = cwds.get(pid, "")
-        sess = _match_session(at, cwd, idx)
+        cwd = cwds.get(roots[pid], "") or cwds.get(pid, "")
+        sess = matches[roots[pid]]
         rec = {
             "pid": pid,
+            "root_pid": roots[pid],
             "agent_type": at,
             "pgid": b.get("pgid"),
             "ppid": b.get("ppid"),
@@ -267,7 +307,7 @@ def collect(home=None, with_resources=True, context_limit=None):
             "cost": None, "git_branch": None, "title": None,
             "session_id": None, "session_path": None,
             "last_turn_ms": None, "timestamp": None,
-            "is_main": _is_session_main(b),
+            "is_main": pid == roots[pid],
         }
 
         if sess:
@@ -278,9 +318,12 @@ def collect(home=None, with_resources=True, context_limit=None):
             if not data:
                 data = _ensure_parsed(at, sess)
             # 只有会话主进程承载 token / 成本，避免同一会话被重复计费
-            rec["is_main"] = _is_session_main(b)
+            rec["is_main"] = pid == roots[pid]
             if rec["is_main"]:
                 rec.update(data)
+                if at == "claude" and context_limit:
+                    rec.update(sessions.parse_claude_session(sess["path"], context_limit))
+                rec["session_id"] = rec.get("session_id") or sess.get("session_id")
                 rec["cost_estimated"] = sessions.cost_estimated(rec["model"])
                 rec["cost"] = sessions.calculate_cost(
                     rec["model"], rec["input_tokens"], rec["output_tokens"],
@@ -300,9 +343,10 @@ def collect(home=None, with_resources=True, context_limit=None):
         out.append(rec)
 
     servers = mcp.collect(procs, cwds, out, with_resources=with_resources)
+    out = aggregate_sessions(out)
     conflicts = activity.conflicts(out)
     for rec in out:
-        rec['mcp_servers'] = [g for g in servers if any(rec['pid'] in i['session_pids'] for i in g['instances'])]
+        rec['mcp_servers'] = [g for g in servers if any(set(rec['pids']).intersection(i['session_pids']) for i in g['instances'])]
         rec['cwd_conflict_pids'] = next((c['pids'] for c in conflicts if rec['pid'] in c['pids']), [])
     # 主进程排前面，其次按内存降序
     out.sort(key=lambda r: (r["agent_type"], not r["is_main"],
@@ -318,7 +362,7 @@ def _is_session_main(b):
 
     判据：进程名里带 Helper / Renderer / disclaimer / crashpad 的都是子进程。
     """
-    comm = (b.get("comm") or "").lower()
+    comm = " ".join(str(b.get(k) or "") for k in ("comm", "path", "executable")).lower()
     for marker in ("helper", "renderer", "disclaimer", "crashpad",
                    "gpu-process", "utility"):
         if marker in comm:
@@ -329,7 +373,7 @@ def _is_session_main(b):
 def _parse(agent_type, path, context_limit=None):
     """解析会话文件并返回统一字段"""
     if agent_type == "claude":
-        limit = context_limit or sessions.DEFAULT_CONTEXT_LIMIT
+        limit = context_limit
         return sessions.parse_claude_session(path, limit)
     if agent_type == "codex":
         return sessions.parse_codex_session(path)
@@ -340,6 +384,7 @@ def _parse(agent_type, path, context_limit=None):
 
 def totals(sess_list):
     """聚合统计"""
+    sess_list = aggregate_sessions(sess_list)
     t = {
         "sessions": len(sess_list),
         "input_tokens": 0, "output_tokens": 0,
@@ -372,7 +417,8 @@ def totals(sess_list):
 
 def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
     """生成告警列表"""
-    out = [{'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
+    sess_list = aggregate_sessions(sess_list)
+    out = [{'count':len(c['pids']), 'pids':c['pids'], 'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
             'msg':f"Multiple sessions share cwd {c['cwd']}: {c['pids']}; possible file conflict"}
            for c in activity.conflicts(sess_list)]
     now = time.time()
@@ -380,14 +426,14 @@ def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
         pct = s.get("context_pct")
         if pct is not None and pct <= context_warn:
             out.append({
-                "level": "warn", "pid": s["pid"], "agent": s["agent_type"],
+                "level": "warn", "pid": s["pid"], "agent": s.get("agent_type"),
                 "kind": "CONTEXT_LOW",
                 "msg": f"上下文剩余 {pct}%，建议 /compact",
             })
         mem = s.get("mem_mb")
         if mem and mem >= mem_warn_mb:
             out.append({
-                "level": "warn", "pid": s["pid"], "agent": s["agent_type"],
+                "level": "warn", "pid": s["pid"], "agent": s.get("agent_type"),
                 "kind": "MEM_HIGH",
                 "msg": f"内存占用 {mem:.0f} MB",
             })
@@ -398,10 +444,85 @@ def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
                 age = now - os.path.getmtime(sp)
                 if age > idle_warn_s:
                     out.append({
-                        "level": "info", "pid": s["pid"], "agent": s["agent_type"],
+                        "level": "info", "pid": s["pid"], "agent": s.get("agent_type"),
                         "kind": "IDLE",
                         "msg": f"会话已 {int(age / 60)} 分钟无更新",
                     })
             except OSError:
                 pass
+    return aggregate_alerts(out)
+
+
+def project_name(cwd):
+    if not cwd:
+        return None
+    try:
+        result = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.basename(result.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return os.path.basename(os.path.normpath(cwd)) or cwd
+
+
+def aggregate_sessions(records):
+    """Idempotent session view. Identity is log ID/path, ancestry, then PID; never cwd alone."""
+    records = list(records)
+    by_pid = {r.get("pid"): r for r in records}
+    def identity(r):
+        seen = set()
+        while not r.get("session_id") and not r.get("session_path"):
+            parent = r.get("root_pid") or r.get("ppid")
+            if parent not in by_pid or parent == r.get("pid") or parent in seen:
+                break
+            seen.add(parent)
+            candidate = by_pid[parent]
+            if candidate.get("agent_type") != r.get("agent_type"):
+                break
+            r = candidate
+        return (r.get("agent_type"), r.get("session_id") or r.get("session_path") or
+                "pid:" + str(r.get("root_pid") or r.get("pid")))
+    groups = {}
+    for r in records:
+        # Unattached helpers are resource records, not independently known sessions.
+        key = identity(r)
+        if not r.get("is_main", True) and key[1] == "pid:" + str(r.get("pid")):
+            continue
+        groups.setdefault(key, []).append(r)
+    out = []
+    projects = {}
+    for key, members in groups.items():
+        main = min(members, key=lambda r: (not r.get("is_main", True),
+                   r.get("pid") != r.get("root_pid", r.get("pid")), r.get("pid") or 0))
+        row = dict(main)
+        row.update(session_id=key[1], is_main=True,
+                   processes=sum(r.get("processes", 1) for r in members),
+                   pids=sorted({p for r in members for p in r.get("pids", [r.get("pid")]) if p is not None}))
+        for field in ("mem_mb", "cpu_pct"):
+            values = [r[field] for r in members if r.get(field) is not None]
+            row[field] = round(sum(values), 1) if values else None
+        cwd = row.get("cwd")
+        if cwd not in projects:
+            projects[cwd] = row.get("project") or project_name(cwd)
+        row["project"] = projects[cwd]
+        out.append(row)
     return out
+
+
+def aggregate_alerts(items):
+    """One row per kind, retaining legacy pid/msg and adding affected session count/PIDs."""
+    grouped = {}
+    for item in items:
+        key = (item.get("level"), item.get("kind"))
+        row = grouped.setdefault(key, dict(item, count=0, pids=[]))
+        pids = item.get("pids") or ([item["pid"]] if item.get("pid") is not None else [])
+        new = set(pids) - set(row["pids"])
+        row["count"] += len(new) if pids else item.get("count", 1)
+        row["pids"] = sorted(set(row["pids"]) | set(pids))
+    for row in grouped.values():
+        n = row["count"]
+        if n > 1:
+            row["msg"] = {"CWD_CONFLICT": f"{n} 个会话共享工作目录", "IDLE": f"{n} 个会话长时间无活动",
+                          "CONTEXT_LOW": f"{n} 个会话上下文余量不足", "MEM_HIGH": f"{n} 个会话内存占用较高"}.get(row.get("kind"), row.get("msg"))
+    return list(grouped.values())

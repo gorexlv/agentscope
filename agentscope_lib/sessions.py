@@ -165,7 +165,7 @@ def format_tokens(n):
 
 # ── Claude Code ────────────────────────────────────────────────
 
-def parse_claude_session(path, context_limit=DEFAULT_CONTEXT_LIMIT):
+def parse_claude_session(path, context_limit=None):
     """解析 Claude Code 会话文件尾部，取最近一次 assistant 的 usage"""
     from .procstat import read_file_tail
 
@@ -216,7 +216,8 @@ def parse_claude_session(path, context_limit=DEFAULT_CONTEXT_LIMIT):
                 "cache_create_tokens": cc,
                 "cache_read_tokens": cr,
                 "context_used": used,
-                "context_pct": max(0, min(100, round((context_limit - used) / context_limit * 100))),
+                "context_pct": (max(0, min(100, round((context_limit - used) / context_limit * 100)))
+                                if context_limit and context_limit > 0 else None),
                 "model": model,
                 "stop_reason": msg.get("stop_reason"),
                 "git_branch": d.get("gitBranch"),
@@ -343,7 +344,7 @@ def parse_codex_session(path):
             info = payload["info"]
             cum = info.get("total_token_usage") or {}
             last = info.get("last_token_usage") or {}
-            ctx_window = info.get("model_context_window") or DEFAULT_CONTEXT_LIMIT
+            ctx_window = info.get("model_context_window")
             inp = cum.get("input_tokens") or 0
             cr = cum.get("cached_input_tokens") or 0
             out = (cum.get("output_tokens") or 0) + (cum.get("reasoning_output_tokens") or 0)
@@ -356,7 +357,8 @@ def parse_codex_session(path):
                 "cache_create_tokens": cum.get("cache_write_input_tokens") or 0,
                 "context_used": ctx_used,
                 "context_limit": ctx_window,
-                "context_pct": max(0, min(100, round((ctx_window - ctx_used) / ctx_window * 100))),
+                "context_pct": (max(0, min(100, round((ctx_window - ctx_used) / ctx_window * 100)))
+                                if ctx_window and ctx_window > 0 else None),
                 "model": payload.get("model") or result.get("model"),
             })
             break
@@ -470,8 +472,9 @@ def parse_opencode_session(path):
                 result["cache_read_tokens"] = cache.get("read") or 0
                 result["cache_create_tokens"] = cache.get("write") or 0
                 used = inp + result["cache_read_tokens"] + result["cache_create_tokens"]
-                limit = tokens.get("limit") or DEFAULT_CONTEXT_LIMIT
+                limit = tokens.get("limit")
                 result["context_used"] = used
                 result["context_limit"] = limit
-                result["context_pct"] = max(0, min(100, round((limit - used) / limit * 100)))
+                result["context_pct"] = (max(0, min(100, round((limit - used) / limit * 100)))
+                                         if limit and limit > 0 else None)
     return result

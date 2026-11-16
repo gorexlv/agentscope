@@ -1,11 +1,90 @@
 {
   "schema": 1,
   "generated_at": "2026-11-16T10:00:00+08:00",
-  "daemon": {"pid": 123, "version": "x.y.z", "interval_s": 120, "last_clean_at": "…|null"},
-  "host": {"load1": 2.1, "load5": 2.4, "load15": 2.0, "ncpu": 12, "mem_used_pct": 61.5, "swap_used_gb": 1.2},
-  "sessions": [{"pid": 1, "agent": "claude", "model": "…", "cwd": "…", "branch": "…", "state": "working|waiting|idle|stuck|unknown", "cpu_pct": 3.2, "mem_mb": 410, "context_pct": 64, "cost_usd": 0.42}],
-  "totals": {"sessions": 5, "cost_usd": 3.1, "tokens": 120000},
-  "alerts": [{"level": "warn|info", "kind": "CONTEXT_LOW|MEM_HIGH|IDLE|…", "pid": 1, "msg": "…"}],
-  "orphans": {"groups": 2, "processes": 9},
-  "reclaim": {"worktrees_gb": 8.3, "removable": 47, "updated_at": "…|null"}
+  "daemon": {
+    "pid": 123,
+    "version": "x.y.z",
+    "interval_s": 120,
+    "last_clean_at": "…|null"
+  },
+  "host": {
+    "load1": 2.1,
+    "load5": 2.4,
+    "load15": 2.0,
+    "ncpu": 12,
+    "mem_used_pct": 61.5,
+    "swap_used_gb": 1.2
+  },
+  "sessions": [
+    {
+      "pid": 1,
+      "session_id": "fixture-claude",
+      "project": "agentscope",
+      "agent": "claude",
+      "model": "Claude Opus",
+      "cwd": "/tmp/agentscope",
+      "branch": "main",
+      "state": "working",
+      "mem_mb": 410,
+      "context_pct": 64,
+      "cost_usd": 0.42,
+      "processes": 1
+    },
+    {
+      "pid": 2,
+      "session_id": "fixture-codex-a",
+      "project": "design-system",
+      "agent": "codex",
+      "model": "GPT-5",
+      "cwd": "/tmp/design-system",
+      "branch": "feat/components",
+      "state": "working",
+      "mem_mb": 1200,
+      "context_pct": 82,
+      "cost_usd": 0.17,
+      "processes": 4
+    },
+    {
+      "pid": 3,
+      "session_id": "fixture-codex-b",
+      "project": "design-system",
+      "agent": "codex",
+      "model": "GPT-5",
+      "cwd": "/tmp/design-system",
+      "branch": "main",
+      "state": "waiting",
+      "mem_mb": 400,
+      "context_pct": null,
+      "cost_usd": null,
+      "processes": 2
+    }
+  ],
+  "totals": {
+    "sessions": 3,
+    "cost_usd": 0.59,
+    "tokens": 120000
+  },
+  "alerts": [
+    {
+      "level": "warn",
+      "kind": "CWD_CONFLICT",
+      "pid": 2,
+      "msg": "2 个会话共享同一目录",
+      "count": 2,
+      "pids": [
+        2,
+        3
+      ]
+    }
+  ],
+  "orphans": {
+    "groups": 2,
+    "processes": 9,
+    "cleanable_groups": 2
+  },
+  "reclaim": {
+    "worktrees_gb": 8.3,
+    "removable": 47,
+    "updated_at": "…|null"
+  }
 }

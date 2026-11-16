@@ -156,12 +156,16 @@ def session_state(record):
 
 def session_rows(sessions):
     """契约里的会话条目：只保留会话主进程，避免 helper 重复。"""
+    from . import agents
     rows = []
-    for record in sessions:
+    for record in agents.aggregate_sessions(sessions):
         if not record.get('is_main', True):
             continue
         rows.append({
             'pid': record.get('pid'),
+            'session_id': record.get('session_id'),
+            'project': record.get('project'),
+            'processes': record.get('processes'),
             'agent': record.get('agent_type'),
             'model': record.get('model'),
             'cwd': record.get('cwd'),
@@ -186,8 +190,10 @@ def totals(sessions, rows=None):
 
 
 def alert_rows(alerts):
-    return [{'level': item.get('level'), 'kind': item.get('kind'),
-             'pid': item.get('pid'), 'msg': item.get('msg')} for item in alerts]
+    from . import agents
+    return [{'count': item.get('count'), 'pids': item.get('pids'),
+             'level': item.get('level'), 'kind': item.get('kind'),
+             'pid': item.get('pid'), 'msg': item.get('msg')} for item in agents.aggregate_alerts(alerts)]
 
 
 # ─────────────────────────────────────────────────────────────

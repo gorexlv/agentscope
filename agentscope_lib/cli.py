@@ -321,7 +321,7 @@ def register(sub):
     p.add_argument("--json", action="store_true")
     p.add_argument("--alerts", action="store_true", help="同时显示告警")
     p.add_argument("--fast", action="store_true", help="跳过 CPU/内存采集（更快）")
-    p.add_argument("--context-limit", type=int, default=200000,
+    p.add_argument("--context-limit", type=int, default=None,
                    help="上下文窗口上限，用于计算剩余比例")
     p.add_argument("--sort", default="mem",
                    choices=["cpu", "mem", "ctx", "cost", "tokens"],
@@ -341,7 +341,7 @@ def register(sub):
     p.add_argument("--node", action="store_true", default=True,
                    help="显示 node 内存段（默认开启）")
     p.add_argument("--no-node", dest="node", action="store_false")
-    p.add_argument("--context-limit", type=int, default=200000)
+    p.add_argument("--context-limit", type=int, default=None)
     p.set_defaults(func=cmd_panel)
 
     p = sub.add_parser("node", help="node/Electron 内存与堆上限诊断")
