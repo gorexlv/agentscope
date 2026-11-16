@@ -6,7 +6,7 @@
   {"op":"ping"}                            → {"ok":true,"version":"…"}
   {"op":"snapshot"}                        → {"ok":true,"snapshot":{…}}
   {"op":"clean","dry_run":true}            → {"ok":true,"token":"…","targets":[…]}
-  {"op":"clean","dry_run":false,"token":…} → {"ok":true,"cleaned":[…],"skipped":[…]}
+  {"op":"clean","dry_run":false,"token":…} → {"ok":true,"cleaned":[…],"gone":[…],"skipped":[…]}
   其它                                     → {"ok":false,"error":"…"}
 
 安全约束：
@@ -333,11 +333,14 @@ class SnapshotServer:
             if op == 'snapshot':
                 return {'ok': True, 'snapshot': self.snapshot_provider()}
             if op == 'clean':
+                cache = self._fresh_cache() if request.get('dry_run') is True else None
+                if cache is not None:
+                    return self._clean(request, cache)
                 from .cleanup import CLEANUP_LOCK
                 if not CLEANUP_LOCK.acquire(blocking=False):
                     return {'ok': False, 'error': 'busy, retry'}
                 try:
-                    return self._clean(request)
+                    return self._clean(request, cache)
                 finally:
                     CLEANUP_LOCK.release()
         except (TimeoutError, subprocess.TimeoutExpired):
@@ -346,13 +349,18 @@ class SnapshotServer:
             return {'ok': False, 'error': str(error)}
         return {'ok': False, 'error': 'unknown op'}
 
-    def _clean(self, request):
+    def _fresh_cache(self):
+        cache = self.clean_cache() if self.clean_cache else None
+        interval = max(0.1, self.daemon_info.get('interval_s') or self.refresh_interval)
+        if cache is not None and 0 <= time.monotonic() - cache['monotonic'] <= 2 * interval:
+            return cache
+        return None
+
+    def _clean(self, request, cache=None):
         if type(request.get('dry_run')) is not bool:
             return {'ok': False, 'error': 'dry_run must be a boolean'}
         if request['dry_run']:
-            cache = self.clean_cache() if self.clean_cache else None
-            interval = max(0.1, self.daemon_info.get('interval_s') or self.refresh_interval)
-            if cache is not None and 0 <= time.monotonic() - cache['monotonic'] <= 2 * interval:
+            if cache is not None:
                 groups, source, as_of = cache['groups'], 'cache', cache['as_of']
             else:
                 groups, source = self.clean_targets(), 'live'
@@ -361,23 +369,24 @@ class SnapshotServer:
             targets = [{'pgid': group['pgid'], 'size': group.get('size', 0),
                         'cwd': group.get('cwd'), 'names': group.get('names', [])}
                        for group in groups]
-            return {'ok': True, 'token': token, 'targets': targets, 'source': source, 'as_of': as_of}
+            return {'ok': True, 'token': token, 'targets': targets, 'source': source,
+                    'as_of': as_of, 'executable': self.allow_cleanup}
         if not self.allow_cleanup:
             return {'ok': False, 'error': 'daemon is in dry-run mode'}
         groups = self._consume_token(request.get('token'))
         if groups is None:
             return {'ok': False, 'error': 'invalid or expired token'}
-        cleaned, skipped = [], []
+        cleaned, gone, skipped = [], [], []
         for group in groups:
             ok, result, reason = self.clean_group(group)
             if ok and result in ('cleaned', 'gone'):
-                cleaned.append(group['pgid'])
+                (cleaned if result == 'cleaned' else gone).append(group['pgid'])
                 if result == 'cleaned':
                     self.daemon_info['last_clean_at'] = datetime.datetime.now().astimezone().isoformat()
             else:
                 skipped.append({'pgid': group['pgid'],
                                 'reason': reason or result or 'not cleanable'})
-        return {'ok': True, 'cleaned': cleaned, 'skipped': skipped}
+        return {'ok': True, 'cleaned': cleaned, 'gone': gone, 'skipped': skipped}
 
     # ── token ───────────────────────────────────────────────
     def _issue_token(self, groups):

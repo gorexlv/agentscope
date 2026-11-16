@@ -33,7 +33,7 @@ import time
 import threading
 import copy
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ─────────────────────────────────────────────────────────────
 # libproc 绑定：绕过 ps/top 的沙箱限制，直接读内核进程表

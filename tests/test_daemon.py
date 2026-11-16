@@ -225,6 +225,25 @@ class SocketTests(DaemonTestCase):
         self.assertEqual(result['skipped'][0]['pgid'], 100)
         self.assertEqual(result['skipped'][0]['reason'], 'revalidation failed')
 
+    def test_14c_gone_is_separate_from_cleaned(self):
+        outcomes = iter([(True, 'cleaned', None), (True, 'gone', None),
+                         (False, 'skipped', 'revalidation failed')])
+        server = self.make_server(
+            clean_targets=lambda: [fake_group(100), fake_group(200), fake_group(300)],
+            clean_group=lambda group: next(outcomes))
+        response = server.dispatch({'op': 'clean', 'dry_run': True})
+        result = server.dispatch({'op': 'clean', 'dry_run': False, 'token': response['token']})
+        self.assertEqual(result['cleaned'], [100])
+        self.assertEqual(result['gone'], [200])
+        self.assertEqual(result['skipped'], [{'pgid': 300, 'reason': 'revalidation failed'}])
+
+    def test_14d_preview_reports_whether_daemon_can_execute(self):
+        server = self.make_server()
+        for allow_cleanup in (True, False):
+            server.allow_cleanup = allow_cleanup
+            response = server.dispatch({'op': 'clean', 'dry_run': True})
+            self.assertIs(response['executable'], allow_cleanup)
+
     def test_15_missing_token_is_rejected(self):
         server = self.make_server()
         response = server_mod.request({'op': 'clean', 'dry_run': False}, path=server.path)
@@ -340,7 +359,7 @@ class WatchTests(DaemonTestCase):
 
     def test_20_snapshot_failure_does_not_break_round(self):
         args = type('Args', (), {'dry_run': True, 'interval': 30})()
-        state = {'daemon': {'pid': os.getpid(), 'version': '1.1.0', 'interval_s': 30,
+        state = {'daemon': {'pid': os.getpid(), 'version': '1.2.0', 'interval_s': 30,
                             'last_clean_at': None}, 'snapshot': None}
         with patch.object(cleanup, 'analyze', return_value=({}, [])), \
                 patch.object(cleanup, 'metrics', create=True), \
@@ -354,7 +373,7 @@ class WatchTests(DaemonTestCase):
 
     def test_21_round_writes_snapshot_file(self):
         args = type('Args', (), {'dry_run': True, 'interval': 30})()
-        state = {'daemon': {'pid': os.getpid(), 'version': '1.1.0', 'interval_s': 30,
+        state = {'daemon': {'pid': os.getpid(), 'version': '1.2.0', 'interval_s': 30,
                             'last_clean_at': None}, 'snapshot': None}
         with patch.object(cleanup, 'analyze', return_value=({}, [])), \
                 patch('agentscope_lib.metrics.write'), \

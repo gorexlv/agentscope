@@ -152,8 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 switch result {
                 case .success(let reply):
                     let skipped = reply.skipped?.map { "\($0.pgid.map(String.init) ?? "—")：\($0.reason ?? "—")" }.joined(separator: "\n") ?? "—"
-                    message("清理结果", "已清理：\(reply.cleaned?.map(String.init).joined(separator: ", ") ?? "—")\n跳过：\(skipped)")
-                case .failure(let error): message("未取得清理结果", "\(error.localizedDescription)\n请求可能已执行，请刷新查看；不会自动重试。")
+                    message("清理结果", "已清理：\(reply.cleaned?.map(String.init).joined(separator: ", ") ?? "—")\n已自行退出：\(reply.gone?.map(String.init).joined(separator: ", ") ?? "—")\n跳过：\(skipped)")
+                case .failure(let error):
+                    let failure = cleanupFailureMessage(error)
+                    message(failure.title, failure.detail)
                 }
             }
         }

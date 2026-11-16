@@ -53,6 +53,29 @@ final class CoreTests: XCTestCase {
         _ = flow.begin(); try flow.preview(decode(Reply.self, #"{"ok":true,"token":"t","targets":[]}"#))
         XCTAssertThrowsError(try flow.confirm())
     }
+    func testBusyFailureDiffersFromUnknownExecutionOutcome() {
+        let busy = cleanupFailureMessage(ClientError.busy)
+        XCTAssertEqual(busy.title, "清理未执行")
+        XCTAssertTrue(busy.detail.contains("daemon 正忙，未执行。请重新预演。"))
+        XCTAssertFalse(busy.detail.contains("可能已执行"))
+        let unknown = cleanupFailureMessage(ClientError.message("daemon 响应超时，请稍后重试"))
+        XCTAssertEqual(unknown.title, "未取得清理结果")
+        XCTAssertTrue(unknown.detail.contains("请求可能已执行，请刷新查看"))
+    }
+    func testDryRunDaemonPreviewCannotBeExecuted() throws {
+        let reply = try decode(Reply.self, #"{"ok":true,"token":"t","executable":false,"targets":[{"pgid":42}]}"#)
+        var flow = CleanupFlow()
+        _ = flow.begin()
+        XCTAssertThrowsError(try flow.preview(reply)) { error in
+            XCTAssertEqual(error.localizedDescription, "daemon 处于预演模式，无法执行")
+        }
+        XCTAssertThrowsError(try flow.confirm())
+    }
+    func testCleanupResultsIncludeGoneSeparately() throws {
+        let reply = try decode(Reply.self, #"{"ok":true,"cleaned":[10],"gone":[20],"skipped":[]}"#)
+        XCTAssertEqual(reply.cleaned, [10])
+        XCTAssertEqual(reply.gone, [20])
+    }
     func testOfflineFallback() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

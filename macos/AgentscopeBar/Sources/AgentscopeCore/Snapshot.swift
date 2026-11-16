@@ -44,13 +44,27 @@ public struct Reply: Decodable {
     public var as_of: String?
     public var token: String?
     public var targets: [Target]?
+    public var executable: Bool?
     public var cleaned: [Int]?
+    public var gone: [Int]?
     public var skipped: [Skipped]?
     public struct Skipped: Decodable { public var pgid: Int?; public var reason: String? }
 }
+public func cleanupFailureMessage(_ error: Error) -> (title: String, detail: String) {
+    if case ClientError.busy = error {
+        return ("清理未执行", "daemon 正忙，未执行。请重新预演。")
+    }
+    return ("未取得清理结果", "\(error.localizedDescription)\n请求可能已执行，请刷新查看；不会自动重试。")
+}
 public enum ClientError: Error, LocalizedError {
+    case busy
     case message(String)
-    public var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
+    public var errorDescription: String? {
+        switch self {
+        case .busy: return "daemon 正忙，请稍后重试"
+        case .message(let text): return text
+        }
+    }
 }
 public struct CleanupFlow {
     public enum State: Equatable { case idle, previewing, awaitingConfirmation(String, Date), executing, finished }
@@ -64,6 +78,7 @@ public struct CleanupFlow {
     public mutating func preview(_ reply: Reply, now: Date = Date()) throws {
         guard state == .previewing, reply.ok == true, let token = reply.token, !token.isEmpty,
               let targets = reply.targets else { cancel(); throw ClientError.message("清理预演响应无效") }
+        guard reply.executable != false else { cancel(); throw ClientError.message("daemon 处于预演模式，无法执行") }
         self.targets = targets; state = .awaitingConfirmation(token, now)
     }
     public mutating func confirm(now: Date = Date()) throws -> [String: Any] {
