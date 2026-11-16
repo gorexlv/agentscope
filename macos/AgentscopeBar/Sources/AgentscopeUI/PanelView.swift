@@ -70,23 +70,26 @@ public struct PanelView: View {
             overview
             if !online {
                 Label(snapshot == nil ? "暂时无法读取快照，请启动 agentscope watch。" : "正在显示本地快照，连接恢复后自动更新。", systemImage: "wifi.slash")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    .font(.caption).foregroundStyle(Color.secondary).fixedSize(horizontal: false, vertical: true)
                     .accessibilityLabel(error ?? "离线，读取本地快照")
             }
             if !alerts.isEmpty { attention }
             Divider()
             if rendering {
-                GeometryReader { geometry in
-                    sessionList.frame(width: geometry.size.width, alignment: .topLeading)
-                        .fixedSize(horizontal: false, vertical: true)
-                }.clipped()
+                sessionList.frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 ScrollView { sessionList.frame(maxWidth: .infinity, alignment: .leading) }
                     .scrollIndicators(.automatic)
             }
             Divider()
             maintenance
-        }.padding(16).frame(width: 340, height: height).background(.regularMaterial)
+        }.padding(16).frame(width: 340, height: rendering ? nil : height)
+            .foregroundStyle(Color.primary)
+            .background {
+                Rectangle().fill(.regularMaterial)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
     }
     private var header: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -98,18 +101,19 @@ public struct PanelView: View {
                         Text(online ? "已连接" : "离线·读取快照").font(.system(size: 10, weight: .medium))
                     }.padding(.horizontal, 7).padding(.vertical, 4)
                         .background(.quaternary, in: Capsule())
+                        .overlay(Capsule().strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
                 }
                 if rendering {
-                    Text(updated(at: now)).font(.caption).foregroundStyle(.secondary)
+                    Text(updated(at: now)).font(.caption).foregroundStyle(Color.secondary)
                 } else {
                     TimelineView(.periodic(from: now, by: 10)) { timeline in
-                        Text(updated(at: timeline.date)).font(.caption).foregroundStyle(.secondary)
+                        Text(updated(at: timeline.date)).font(.caption).foregroundStyle(Color.secondary)
                     }
                 }
             }
             Spacer(minLength: 0)
             if rendering {
-                Image(systemName: "gearshape").font(.body).foregroundStyle(.secondary)
+                Image(systemName: "gearshape").font(.body).foregroundStyle(Color.secondary)
             } else {
             Menu {
                 Menu("刷新间隔") {
@@ -127,7 +131,7 @@ public struct PanelView: View {
                 Button("打开面板", action: actions.panel)
                 Divider()
                 Button("退出 agentscope", action: actions.quit)
-            } label: { Image(systemName: "gearshape").font(.body).foregroundStyle(.secondary) }
+            } label: { Image(systemName: "gearshape").font(.body).foregroundStyle(Color.secondary) }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             .accessibilityLabel("设置")
             }
@@ -152,15 +156,24 @@ public struct PanelView: View {
             metric("内存", value: snapshot?.host?.mem_used_pct.map { String(format: "%.0f%%", $0) } ?? "—",
                    progress: snapshot?.host?.mem_used_pct.map { $0 / 100 }, symbol: "memorychip")
             VStack(spacing: 6) {
-                Image(systemName: "square.stack.3d.up").font(.title3).frame(height: 24).foregroundStyle(.secondary)
+                Image(systemName: "square.stack.3d.up").font(.title3).frame(height: 24).foregroundStyle(Color.secondary)
                 Text(snapshot?.sessions.map { String($0.count) } ?? "—").font(.title3).monospacedDigit()
-                Text("会话").font(.caption).foregroundStyle(.secondary)
-                Text("今日 " + format(snapshot?.totals?.today_cost_usd, prefix: "$"))
-                    .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
-                    .accessibilityLabel("今日合计成本 \(format(snapshot?.totals?.today_cost_usd, prefix: "$"))")
+                Text("会话").font(.caption).foregroundStyle(Color.secondary)
+                Text(costSummary)
+                    .font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
+                    .accessibilityLabel(costAccessibility)
             }.frame(maxWidth: .infinity).padding(.vertical, 12)
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
         }
+    }
+    private var costSummary: String {
+        if let today = snapshot?.totals?.today_cost_usd { return "今日 " + format(today, prefix: "$") }
+        let known = sessions.compactMap(\.cost_usd).filter(\.isFinite)
+        return known.isEmpty ? "成本未知" : format(known.reduce(0, +), prefix: "$")
+    }
+    private var costAccessibility: String {
+        snapshot?.totals?.today_cost_usd == nil ? "已知会话成本合计，" + costSummary : costSummary
     }
     private var loadProgress: Double? {
         guard let load = snapshot?.host?.load1, let cores = snapshot?.host?.ncpu, cores > 0 else { return nil }
@@ -175,14 +188,15 @@ public struct PanelView: View {
                         .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                         .rotationEffect(.degrees(-90))
                 }
-                Image(systemName: symbol).font(.system(size: 10)).foregroundStyle(.secondary)
+                Image(systemName: symbol).font(.system(size: 10)).foregroundStyle(Color.secondary)
             }.frame(width: 24, height: 24).accessibilityHidden(true)
             Text(value).font(.title3).monospacedDigit()
-            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(title).font(.caption).foregroundStyle(Color.secondary)
             Text(title == "负载" ? "\(snapshot?.host?.ncpu.map(String.init) ?? "—") 核心" : "已使用")
-                .font(.caption2).foregroundStyle(.secondary)
+                .font(.caption2).foregroundStyle(Color.secondary)
         }.frame(maxWidth: .infinity).padding(.vertical, 12)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
             .accessibilityElement(children: .ignore).accessibilityLabel("\(title) \(value)")
     }
     private var attention: some View {
@@ -211,19 +225,19 @@ public struct PanelView: View {
         }
     }
     private var sessionList: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 4) {
             Text("会话").font(.subheadline.weight(.semibold))
             if sessions.isEmpty {
                 VStack(spacing: 8) {
                     Image(systemName: "terminal").font(.title2).foregroundStyle(.tertiary)
-                    Text(snapshot == nil ? "连接后，会话会显示在这里" : "暂无运行中的会话").font(.caption).foregroundStyle(.secondary)
+                    Text(snapshot == nil ? "连接后，会话会显示在这里" : "暂无运行中的会话").font(.caption).foregroundStyle(Color.secondary)
                 }.frame(maxWidth: .infinity).padding(.vertical, 16)
             }
             ForEach(agents, id: \.self) { agent in
                 let group = sessions.filter { ($0.agent ?? "其他") == agent }
                 let known = group.compactMap(\.mem_mb)
                 Text("\(agent == "codex" ? "Codex" : agent == "claude" ? "Claude" : agent.capitalized) · \(group.count) 个会话 · \(memoryText(known.isEmpty ? nil : known.reduce(0, +)))")
-                    .font(.subheadline).foregroundStyle(.secondary)
+                    .font(.subheadline.weight(.regular)).foregroundStyle(Color.secondary)
                 ForEach(Array(visibleSessions.filter { ($0.agent ?? "其他") == agent }.enumerated()), id: \.offset) { _, session in
                     SessionRow(session: session)
                 }
@@ -253,7 +267,7 @@ public struct PanelView: View {
                     Spacer()
                     Image(systemName: "arrow.up.right").font(.caption2)
                 }
-            }.foregroundStyle(.secondary).accessibilityHint("在终端打开 agentscope worktrees 报告")
+            }.foregroundStyle(Color.secondary).accessibilityHint("在终端打开 agentscope worktrees 报告")
         }.font(.callout).buttonStyle(.plain)
     }
 }
@@ -262,11 +276,20 @@ private struct SessionRow: View {
     let session: Snapshot.Session
     @State private var hovering = false
     private var project: String {
-        session.project ?? session.cwd.map { URL(fileURLWithPath: $0).lastPathComponent }.flatMap { $0.isEmpty ? nil : $0 } ?? "—"
+        let name = session.agent == "codex" ? "Codex" : session.agent == "claude" ? "Claude" : session.agent?.capitalized ?? "Agent"
+        let project = session.project?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwd = session.cwd?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cwd == "/" { return name + " 桌面" }
+        if let project, !project.isEmpty, project != "/" { return project }
+        if let cwd, !cwd.isEmpty {
+            let last = URL(fileURLWithPath: cwd).lastPathComponent
+            if !last.isEmpty, last != "/" { return last }
+        }
+        return name + " 桌面"
     }
     private var detail: String {
         let pieces = [session.branch, session.model].compactMap { $0 }.filter { !$0.isEmpty }
-        return pieces.isEmpty ? "—" : pieces.joined(separator: " · ")
+        return pieces.joined(separator: " · ")
     }
     private var symbol: String {
         switch session.agent {
@@ -294,10 +317,12 @@ private struct SessionRow: View {
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
-                    Image(systemName: symbol).font(.body).foregroundStyle(.secondary).frame(width: 20)
+                    Image(systemName: symbol).font(.body).foregroundStyle(Color.secondary).frame(width: 20)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(project).font(.body).lineLimit(1).truncationMode(.middle)
-                        Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        if !detail.isEmpty {
+                            Text(detail).font(.caption).foregroundStyle(Color.secondary).lineLimit(1)
+                        }
                     }
                     Spacer(minLength: 0)
                     VStack(alignment: .trailing, spacing: 3) {
@@ -306,7 +331,7 @@ private struct SessionRow: View {
                             Text(memoryText(session.mem_mb)).font(.caption).monospacedDigit()
                         }
                         if let cost = session.cost_usd {
-                            Text(format(cost, prefix: "$")).font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                            Text(format(cost, prefix: "$")).font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
                         }
                     }
                 }
@@ -320,7 +345,7 @@ private struct SessionRow: View {
                     }.frame(height: 3)
                         .accessibilityLabel("上下文剩余 \(Int(context))%")
                 }
-            }.padding(8).contentShape(RoundedRectangle(cornerRadius: 8))
+            }.padding(.horizontal, 8).padding(.vertical, 6).contentShape(RoundedRectangle(cornerRadius: 8))
                 .background(hovering ? Color.primary.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).onHover { hovering = $0 }
             .disabled(session.cwd?.isEmpty != false)

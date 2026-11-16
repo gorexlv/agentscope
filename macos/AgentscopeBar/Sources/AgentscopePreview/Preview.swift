@@ -17,7 +17,7 @@ struct Preview {
             NSApp.appearance = NSAppearance(named: scheme == .dark ? .darkAqua : .aqua)
             let view = PanelView(snapshot: snapshot, online: args[3] == "online", rendering: true)
                 .environment(\.colorScheme, scheme)
-                .background(scheme == .dark ? Color(white: 0.12) : Color(white: 0.96))
+
             let renderer = ImageRenderer(content: view)
             renderer.scale = 2
             guard let image = renderer.cgImage,
