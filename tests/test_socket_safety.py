@@ -48,6 +48,17 @@ class SocketSafetyTests(DaemonTestCase):
         self.assertEqual(response['source'], 'live')
         self.assertEqual(response['targets'][0]['pgid'], 100)
 
+    def test_fresh_cached_preview_bypasses_cleanup_lock_but_live_preview_does_not(self):
+        cached = {'groups': [fake_group(101)], 'monotonic': time.monotonic(), 'as_of': 'cached-time'}
+        server = self.make_server(clean_cache=lambda: cached, daemon_info={'interval_s': 1})
+        with cleanup.CLEANUP_LOCK:
+            response = server_mod.request({'op': 'clean', 'dry_run': True}, path=server.path)
+            self.assertTrue(response['ok'], response)
+            self.assertEqual(response['source'], 'cache')
+            cached['monotonic'] -= 3
+            response = server_mod.request({'op': 'clean', 'dry_run': True}, path=server.path)
+            self.assertEqual(response['error'], 'busy, retry')
+
     def test_watch_publishes_cache_and_excludes_cleaned_groups(self):
         from types import SimpleNamespace
         from agentscope_lib import agents
@@ -169,7 +180,8 @@ class SocketSafetyTests(DaemonTestCase):
              patch.object(cleanup, 'parent_exited', return_value=True), \
              patch.object(cleanup.os, 'kill') as kill:
             result = server.dispatch({'op': 'clean', 'dry_run': False, 'token': token})
-        self.assertEqual(result['cleaned'], [100])
+        self.assertEqual(result['cleaned'], [])
+        self.assertEqual(result['gone'], [100])
         kill.assert_not_called()
 
 
