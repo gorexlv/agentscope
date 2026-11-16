@@ -1,9 +1,21 @@
 import XCTest
+import AgentscopeUI
 @testable import AgentscopeCore
 
 final class CoreTests: XCTestCase {
     func decode<T: Decodable>(_ type: T.Type, _ text: String) throws -> T {
         try JSONDecoder().decode(type, from: Data(text.utf8))
+    }
+    func testSessionAdditionsAndUnknownContext() throws {
+        let snapshot = try decode(Snapshot.self, #"{"sessions":[{"session_id":"a","project":"agentscope","processes":19,"context_pct":null}],"alerts":[{"kind":"IDLE","count":2,"pids":[1,2]}]}"#)
+        XCTAssertEqual(snapshot.sessions?.first?.processes, 19)
+        XCTAssertEqual(snapshot.sessions?.first?.project, "agentscope")
+        XCTAssertNil(snapshot.sessions?.first?.context_pct)
+        XCTAssertEqual(snapshot.alerts?.first?.count, 2)
+        XCTAssertEqual(snapshot.alerts?.first?.pids, [1, 2])
+        XCTAssertEqual(memoryText(nil), "—")
+        XCTAssertEqual(memoryText(189), "189 MB")
+        XCTAssertEqual(memoryText(1638), "1.6 GB")
     }
     func testContractFixture() throws {
         let url = Bundle.module.url(forResource: "snapshot", withExtension: "json", subdirectory: "Fixtures")!

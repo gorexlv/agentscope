@@ -1,25 +1,25 @@
 import AppKit
+import SwiftUI
+import AgentscopeUI
 import ServiceManagement
 import AgentscopeCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var item: NSStatusItem!
+final class AppModel: ObservableObject {
     private var timer: Timer?
     private let client = Client()
-    private var snapshot: Snapshot?
-    private var online = false
+    @Published var snapshot: Snapshot?
+    @Published var online = false
     private var refreshing = false
-    private var cleaning = false
+    @Published var cleaning = false
     private var flow = CleanupFlow()
-    private var lastError: String?
+    @Published var lastError: String?
+    @Published var loginEnabled = SMAppService.mainApp.status == .enabled
+    @Published var refreshInterval = 5.0
     private var interval: Double {
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         return [2.0, 5.0, 15.0].contains(saved) ? saved : 5
     }
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        render(); schedule(); refresh()
-    }
+    init() { refreshInterval = interval; schedule(); refresh() }
     private func schedule() {
         timer?.invalidate()
         timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.refresh() }
@@ -39,62 +39,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    private func add(_ menu: NSMenu, _ title: String, action: Selector? = nil, object: Any? = nil) -> NSMenuItem {
-        let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        entry.target = self; entry.representedObject = object; menu.addItem(entry)
-        return entry
-    }
-    private func render() {
-        let title = (snapshot?.title ?? "L — · ⚠ —") + (online ? "" : " · ?")
-        item.button?.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: snapshot?.hasWarning == true ? NSColor.systemOrange : NSColor.labelColor])
-        let menu = NSMenu()
-        _ = add(menu, online ? "agentscope · daemon 已连接" : "daemon 未运行")
-        _ = add(menu, "更新：\(snapshot?.generated_at ?? "—")")
-        if let lastError { _ = add(menu, "读取失败：\(lastError)") }
-        menu.addItem(.separator())
-        _ = add(menu, "会话")
-        if let sessions = snapshot?.sessions {
-            if sessions.isEmpty { _ = add(menu, "无会话") }
-            for session in sessions {
-                _ = add(menu, session.label, action: session.cwd == nil ? nil : #selector(openDirectory(_:)), object: session.cwd)
-            }
-        } else { _ = add(menu, "—") }
-        menu.addItem(.separator())
-        _ = add(menu, "告警")
-        if let alerts = snapshot?.alerts {
-            if alerts.isEmpty { _ = add(menu, "无告警") }
-            for alert in alerts { _ = add(menu, "\(alert.level ?? "—") · \(alert.msg ?? "—")") }
-        } else { _ = add(menu, "—") }
-        menu.addItem(.separator())
-        let count = snapshot?.orphans?.cleanable_groups
-        let clean = add(menu, cleaning ? "正在处理清理请求…" : "清理 \(count.map(String.init) ?? "—") 个孤儿组…", action: #selector(cleanOrphans))
-        clean.isEnabled = online && !cleaning && (count ?? 0) > 0
-        menu.autoenablesItems = false
-        for entry in menu.items where entry.action == nil { entry.isEnabled = false }
-        _ = add(menu, "可回收：\(format(snapshot?.reclaim?.worktrees_gb, suffix: " GB")) · \(snapshot?.reclaim?.removable.map(String.init) ?? "—") 个工作树", action: #selector(worktrees))
-        _ = add(menu, "打开 panel", action: #selector(panel))
-        let refreshMenu = NSMenu()
-        for seconds in [2, 5, 15] {
-            let choice = add(refreshMenu, "\(seconds) 秒", action: #selector(changeInterval(_:)), object: seconds)
-            choice.state = interval == Double(seconds) ? .on : .off
-        }
-        let refreshEntry = add(menu, "刷新间隔"); refreshEntry.submenu = refreshMenu
-        let login = add(menu, "登录时启动", action: #selector(toggleLogin))
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(.separator())
-        _ = add(menu, "退出", action: #selector(quit))
-        item.menu = menu
-    }
-    @objc private func openDirectory(_ sender: NSMenuItem) {
-        if let path = sender.representedObject as? String {
-            let url = URL(fileURLWithPath: path)
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        }
-    }
-    @objc private func changeInterval(_ sender: NSMenuItem) {
-        guard let seconds = sender.representedObject as? Int else { return }
-        UserDefaults.standard.set(seconds, forKey: "refreshInterval"); schedule(); render()
+    private func render() { objectWillChange.send() }
+    func actions() -> PanelActions {
+        PanelActions(clean: { self.cleanOrphans() }, worktrees: { self.worktrees() },
+                     panel: { self.panel() }, quit: { NSApp.terminate(nil) },
+                     login: { self.toggleLogin() }, interval: { seconds in
+                         UserDefaults.standard.set(seconds, forKey: "refreshInterval")
+                         self.refreshInterval = seconds; self.schedule()
+                     })
     }
     private func terminal(_ command: String) {
         // Commands are fixed literals; no snapshot data is interpolated into shell code.
@@ -103,22 +55,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSAppleScript(source: source)?.executeAndReturnError(&error)
         if let error { message("无法打开终端", error.description) }
     }
-    @objc private func worktrees() { terminal("agentscope worktrees") }
-    @objc private func panel() { terminal("agentscope panel") }
-    @objc private func toggleLogin() {
+    private func worktrees() { terminal("agentscope worktrees") }
+    private func panel() { terminal("agentscope panel") }
+    private func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
             else { try SMAppService.mainApp.register() }
             if SMAppService.mainApp.status == .requiresApproval { message("需要批准登录项", "请在系统设置 → 通用 → 登录项中允许 AgentscopeBar。") }
         } catch { message("登录项设置失败", error.localizedDescription) }
+        loginEnabled = SMAppService.mainApp.status == .enabled
         render()
     }
-    @objc private func quit() { NSApp.terminate(nil) }
+    private func quit() { NSApp.terminate(nil) }
     private func message(_ title: String, _ detail: String) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail; alert.addButton(withTitle: "好"); alert.runModal()
     }
-    @objc private func cleanOrphans() {
+    private func cleanOrphans() {
         guard online, !cleaning else { return }
         cleaning = true
         let request = flow.begin(); render()
@@ -161,8 +114,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+    }
+}
+@main
+struct AgentscopeBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    @StateObject private var model = AppModel()
+    var body: some Scene {
+        MenuBarExtra {
+            PanelView(snapshot: model.snapshot, online: model.online, cleaning: model.cleaning,
+                      error: model.lastError, interval: model.refreshInterval,
+                      loginEnabled: model.loginEnabled, actions: model.actions())
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "gauge.with.dots.needle.33percent")
+                    .foregroundStyle(model.snapshot?.hasWarning == true ? Color.orange : Color.primary)
+                Text(model.snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "—")
+                    .monospacedDigit()
+                let count = model.snapshot?.alerts?.filter { $0.level == "warn" }.count ?? 0
+                if count > 0 {
+                    Text("\(count)").font(.caption2.bold()).padding(.horizontal, 4)
+                        .background(.orange.opacity(0.2), in: Capsule())
+                        .accessibilityLabel("\(count) 类警告")
+                }
+            }.accessibilityLabel("agentscope 系统负载与告警")
+        }.menuBarExtraStyle(.window)
+    }
+}

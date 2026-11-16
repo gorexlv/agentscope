@@ -60,6 +60,7 @@ def state(path, cpu_pct=None, now=None):
 def conflicts(rows):
     grouped = {}
     for row in rows:
-        if row.get('cwd') and row.get('is_main', True):
+        if (row.get('cwd') and row.get('is_main', True)
+                and os.path.realpath(row['cwd']) not in ('/', os.path.realpath(os.path.expanduser('~')))):
             grouped.setdefault(os.path.realpath(row['cwd']),set()).add(row['pid'])
     return [{'cwd':cwd,'pids':sorted(pids)} for cwd,pids in grouped.items() if len(pids)>1]

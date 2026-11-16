@@ -35,7 +35,7 @@ def fake_sessions():
              'cwd': '/tmp/work', 'git_branch': 'main', 'activity_state': 'WORKING',
              'cpu_pct': 3.2, 'mem_mb': 410.0, 'context_pct': 64, 'cost': 0.42,
              'input_tokens': 100, 'output_tokens': 20},
-            {'pid': 43, 'agent_type': 'claude', 'is_main': False, 'model': 'claude-opus-5-5',
+            {'pid': 43, 'ppid': 42, 'agent_type': 'claude', 'is_main': False, 'model': 'claude-opus-5-5',
              'cwd': '/tmp/work', 'git_branch': 'main', 'activity_state': 'IDLE',
              'cpu_pct': 0.0, 'mem_mb': 12.0, 'context_pct': None, 'cost': None}]
 

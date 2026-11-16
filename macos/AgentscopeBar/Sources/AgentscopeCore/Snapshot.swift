@@ -8,8 +8,23 @@ public struct Snapshot: Decodable {
     public var alerts: [Alert]?
     public var orphans: Orphans?
     public var reclaim: Reclaim?
-    public struct Host: Decodable { public var load1: Double? }
-    public struct Session: Decodable {
+    public var totals: Totals?
+    public struct Totals: Decodable { public var sessions: Int?; public var cost_usd: Double?; public var today_cost_usd: Double? }
+    public struct Host: Decodable {
+        public var load1: Double?
+        public var ncpu: Int?
+        public var mem_used_pct: Double?
+    }
+    public struct Session: Decodable, Identifiable {
+        public var session_key: String?
+        public var id: String { "\(agent ?? "unknown"):\(session_key ?? session_id ?? pid.map(String.init) ?? cwd ?? "unknown")" }
+        public var pid: Int?
+        public var session_id: String?
+        public var project: String?
+        public var processes: Int?
+        public var model: String?
+        public var branch: String?
+        public var context_pct: Double?
         public var agent: String?
         public var state: String?
         public var cwd: String?
@@ -19,7 +34,13 @@ public struct Snapshot: Decodable {
             "\(agent ?? "—") · \(state ?? "—") · \(format(mem_mb, suffix: " MB")) · \(format(cost_usd, prefix: "$"))"
         }
     }
-    public struct Alert: Decodable { public var level: String?; public var msg: String? }
+    public struct Alert: Decodable {
+        public var level: String?
+        public var msg: String?
+        public var kind: String?
+        public var count: Int?
+        public var pids: [Int]?
+    }
     public struct Orphans: Decodable { public var groups: Int?; public var cleanable_groups: Int? }
     public struct Reclaim: Decodable { public var worktrees_gb: Double?; public var removable: Int? }
     public var title: String { "L \(format(host?.load1)) · ⚠ \(alerts.map { String($0.count) } ?? "—")" }
