@@ -112,6 +112,7 @@ def build_index(home=None, cwds=None, only_cwds=None):
                     "path": fp, "session_id": name[:-6],
                     "agent_type": "claude", "project": proj,
                     "mtime": st.st_mtime, "size": st.st_size,
+                    "start_time": getattr(st, "st_birthtime", None),
                     "cwd": None, "data": None,
                 })
     idx["claude"].sort(key=lambda x: -x["mtime"])
@@ -150,13 +151,14 @@ def _ensure_parsed(agent_type, f):
     return f.get("data") or {}
 
 
-def _match_session(agent_type, cwd, idx, max_age=7200, claimed=()):
+def _match_session(agent_type, cwd, idx, max_age=7200, claimed=(), started=None):
     """给一个进程找对应的会话文件。
 
     Claude Code 有捷径：项目目录名就是 cwd 的 slug，可以直接定位，
     不需要读文件内容。
     """
-    cands = [f for f in idx.get(agent_type, []) if f["path"] not in claimed]
+    cands = [f for f in idx.get(agent_type, []) if f["path"] not in claimed
+             and time.time() - f.get("mtime", 0) < max_age]
     if not cands:
         return None
     ncwd = _norm(cwd)
@@ -167,7 +169,9 @@ def _match_session(agent_type, cwd, idx, max_age=7200, claimed=()):
         slug = sessions.cwd_to_slug(cwd)
         same = [f for f in cands if f.get("project") == slug]
         if same:
-            same.sort(key=lambda x: -x["mtime"])
+            same.sort(key=lambda x: (abs(x["start_time"] - started)
+                                        if started and x.get("start_time") else float("inf"),
+                                        -x["mtime"]))
             # 同目录可能有多个会话文件（不同 session），取最近的
             return same[0]
 
@@ -260,29 +264,31 @@ def collect(home=None, with_resources=True, context_limit=None):
     if with_resources and agent_list:
         mem_map = procstat.footprint_many([p for p, _, _ in agent_list])
 
-    # Resolve ancestry through non-agent intermediates, then match each root once.
-    agent_pids = {pid for pid, _, _ in agent_list}
+    # Only explicit helpers may inherit a direct parent's identity. A CLI remains
+    # independent even under a desktop host or another CLI of the same type.
+    agent_types = {pid: at for pid, at, _ in agent_list}
     roots = {}
-    for pid, at, _ in agent_list:
-        root, parent, seen = pid, procs[pid].get("ppid"), {pid}
-        while parent in procs and parent not in seen:
-            seen.add(parent)
-            if parent in agent_pids and (desktop.get(parent) or detect_agent_type(procs[parent].get("path", ""), procs[parent].get("comm", ""))) == at:
-                root = parent
-            parent = procs[parent].get("ppid")
-        # Reparented crash handlers can be linked by the unique desktop bundle.
-        if root == pid and not _is_session_main(procs[pid]):
-            path = procs[pid].get("path", "")
-            containers = [p for p, kind in desktop.items() if kind == at and
-                          path.startswith(procs[p].get("path", "").split(".app/")[0] + ".app/")]
-            if len(containers) == 1:
-                root = containers[0]
-        roots[pid] = root
+    def root_for(pid, seen=None):
+        seen = set() if seen is None else seen
+        if pid in seen:
+            return pid
+        seen.add(pid)
+        process = procs[pid]
+        parent = process.get("ppid")
+        if (not _is_session_main(process) and parent in agent_types
+                and agent_types[parent] == agent_types[pid]):
+            return root_for(parent, seen)
+        return pid
+    for pid, _, _ in agent_list:
+        roots[pid] = root_for(pid)
     matches, claimed = {}, set()
-    for pid, at, _ in agent_list:
+    for pid, at, _ in sorted(agent_list, key=lambda item: (procs[roots[item[0]]].get("start_time", 0), item[0])):
         root = roots[pid]
         if root not in matches:
-            matches[root] = _match_session(at, cwds.get(root, ""), idx, claimed=claimed)
+            matches[root] = _match_session(at, cwds.get(root, ""), idx, claimed=claimed,
+                                           started=(procs[root].get("start_time", 0) / 1_000_000) or None)
+            if not _is_session_main(procs[root]):
+                matches[root] = None
             if matches[root]:
                 claimed.add(matches[root]["path"])
 
@@ -362,7 +368,13 @@ def _is_session_main(b):
 
     判据：进程名里带 Helper / Renderer / disclaimer / crashpad 的都是子进程。
     """
-    comm = " ".join(str(b.get(k) or "") for k in ("comm", "path", "executable")).lower()
+    path = b.get("path") or b.get("executable") or ""
+    # Inspect executable/bundle names, not arbitrary directories named helper.
+    names = [b.get("comm") or "", os.path.basename(path)]
+    names.extend(part for part in path.split(os.sep) if part.lower().endswith(".app"))
+    if ".app/Contents/Frameworks/" in path and "/Helpers/" in path:
+        names.append("helper")
+    comm = " ".join(names).lower()
     for marker in ("helper", "renderer", "disclaimer", "crashpad",
                    "gpu-process", "utility"):
         if marker in comm:
@@ -418,7 +430,7 @@ def totals(sess_list):
 def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
     """生成告警列表"""
     sess_list = aggregate_sessions(sess_list)
-    out = [{'count':len(c['pids']), 'pids':c['pids'], 'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
+    out = [{'count':len(c['pids']), 'pids':c['pids'], 'cwd':c['cwd'], 'level':'warn', 'kind':'CWD_CONFLICT', 'pid':c['pids'][0],
             'msg':f"Multiple sessions share cwd {c['cwd']}: {c['pids']}; possible file conflict"}
            for c in activity.conflicts(sess_list)]
     now = time.time()
@@ -450,12 +462,21 @@ def alerts(sess_list, context_warn=20, mem_warn_mb=2048, idle_warn_s=600):
                     })
             except OSError:
                 pass
+    by_pid = {r["pid"]: r for r in sess_list}
+    for item in out:
+        record = by_pid.get(item.get("pid"), {})
+        item["session_id"] = record.get("session_id")
+        item["session_key"] = record.get("session_key")
+        if item.get("kind") in ("CONTEXT_LOW", "MEM_HIGH"):
+            item["msg"] = f"{record.get('project') or record.get('agent_type') or '会话'} (PID {item['pid']})：{item['msg']}"
     return aggregate_alerts(out)
 
 
 def project_name(cwd):
     if not cwd:
         return None
+    if os.path.realpath(cwd) == os.path.realpath(os.path.expanduser("~")):
+        return "主目录"
     try:
         result = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
                                 capture_output=True, text=True, timeout=2)
@@ -472,7 +493,7 @@ def aggregate_sessions(records):
     by_pid = {r.get("pid"): r for r in records}
     def identity(r):
         seen = set()
-        while not r.get("session_id") and not r.get("session_path"):
+        while not r.get("is_main", True) and not r.get("session_id") and not r.get("session_path"):
             parent = r.get("root_pid") or r.get("ppid")
             if parent not in by_pid or parent == r.get("pid") or parent in seen:
                 break
@@ -481,14 +502,12 @@ def aggregate_sessions(records):
             if candidate.get("agent_type") != r.get("agent_type"):
                 break
             r = candidate
-        return (r.get("agent_type"), r.get("session_id") or r.get("session_path") or
+        return (r.get("agent_type"), r.get("session_id") or r.get("session_path") or r.get("session_key") or
                 "pid:" + str(r.get("root_pid") or r.get("pid")))
     groups = {}
     for r in records:
-        # Unattached helpers are resource records, not independently known sessions.
+        # Unknown helpers remain separate rather than borrowing an unrelated session.
         key = identity(r)
-        if not r.get("is_main", True) and key[1] == "pid:" + str(r.get("pid")):
-            continue
         groups.setdefault(key, []).append(r)
     out = []
     projects = {}
@@ -496,7 +515,7 @@ def aggregate_sessions(records):
         main = min(members, key=lambda r: (not r.get("is_main", True),
                    r.get("pid") != r.get("root_pid", r.get("pid")), r.get("pid") or 0))
         row = dict(main)
-        row.update(session_id=key[1], is_main=True,
+        row.update(session_key=key[1], is_main=True,
                    processes=sum(r.get("processes", 1) for r in members),
                    pids=sorted({p for r in members for p in r.get("pids", [r.get("pid")]) if p is not None}))
         for field in ("mem_mb", "cpu_pct"):
@@ -515,7 +534,10 @@ def aggregate_alerts(items):
     grouped = {}
     for item in items:
         key = (item.get("level"), item.get("kind"))
-        row = grouped.setdefault(key, dict(item, count=0, pids=[]))
+        row = grouped.setdefault(key, dict(item, count=0, pids=[], session_alerts=[], cwds=[]))
+        row["session_alerts"].extend(item.get("session_alerts") or
+                                     [{k: v for k, v in item.items() if k not in ("session_alerts", "cwds")}])
+        row["cwds"] = sorted(set(row["cwds"]) | set(item.get("cwds") or ([item["cwd"]] if item.get("cwd") else [])))
         pids = item.get("pids") or ([item["pid"]] if item.get("pid") is not None else [])
         new = set(pids) - set(row["pids"])
         row["count"] += len(new) if pids else item.get("count", 1)
@@ -523,6 +545,6 @@ def aggregate_alerts(items):
     for row in grouped.values():
         n = row["count"]
         if n > 1:
-            row["msg"] = {"CWD_CONFLICT": f"{n} 个会话共享工作目录", "IDLE": f"{n} 个会话长时间无活动",
+            row["msg"] = {"CWD_CONFLICT": f"{n} 个会话在 {len(row['cwds'])} 个目录中存在冲突", "IDLE": f"{n} 个会话长时间无活动",
                           "CONTEXT_LOW": f"{n} 个会话上下文余量不足", "MEM_HIGH": f"{n} 个会话内存占用较高"}.get(row.get("kind"), row.get("msg"))
     return list(grouped.values())

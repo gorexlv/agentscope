@@ -15,7 +15,9 @@ public struct Snapshot: Decodable {
         public var ncpu: Int?
         public var mem_used_pct: Double?
     }
-    public struct Session: Decodable {
+    public struct Session: Decodable, Identifiable {
+        public var session_key: String?
+        public var id: String { "\(agent ?? "unknown"):\(session_key ?? session_id ?? pid.map(String.init) ?? cwd ?? "unknown")" }
         public var pid: Int?
         public var session_id: String?
         public var project: String?

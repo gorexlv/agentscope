@@ -21,11 +21,11 @@ def orca_managed(pid, info):
 
 
 def owner_pids(pid, info, session_rows):
-    owners = {s['pid'] for s in session_rows}
+    owners = {member: s['pid'] for s in session_rows for member in (s.get('pids') or [s['pid']])}
     seen = set()
     while pid in info and pid not in seen:
         if pid in owners:
-            return [pid], 'ancestor'
+            return [owners[pid]], 'ancestor'
         seen.add(pid)
         pid = info[pid].get('ppid')
     return [], 'unknown'

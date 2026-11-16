@@ -22,6 +22,15 @@ public func memoryText(_ value: Double?) -> String {
     return value < 1024 ? String(format: "%.0f MB", value) : String(format: "%.1f GB", value / 1024)
 }
 
+private func displayName(_ agent: String?) -> String {
+    switch agent {
+    case "codex": return "Codex"
+    case "claude": return "Claude"
+    case "opencode": return "OpenCode"
+    default: return agent?.capitalized ?? "Agent"
+    }
+}
+
 public struct PanelView: View {
     public var snapshot: Snapshot?
     public var online: Bool
@@ -236,9 +245,9 @@ public struct PanelView: View {
             ForEach(agents, id: \.self) { agent in
                 let group = sessions.filter { ($0.agent ?? "其他") == agent }
                 let known = group.compactMap(\.mem_mb)
-                Text("\(agent == "codex" ? "Codex" : agent == "claude" ? "Claude" : agent.capitalized) · \(group.count) 个会话 · \(memoryText(known.isEmpty ? nil : known.reduce(0, +)))")
+                Text("\(displayName(agent)) · \(group.count) 个会话 · \(memoryText(known.isEmpty ? nil : known.reduce(0, +)))")
                     .font(.subheadline.weight(.regular)).foregroundStyle(Color.secondary)
-                ForEach(Array(visibleSessions.filter { ($0.agent ?? "其他") == agent }.enumerated()), id: \.offset) { _, session in
+                ForEach(visibleSessions.filter { ($0.agent ?? "其他") == agent }) { session in
                     SessionRow(session: session)
                 }
             }
@@ -276,10 +285,11 @@ private struct SessionRow: View {
     let session: Snapshot.Session
     @State private var hovering = false
     private var project: String {
-        let name = session.agent == "codex" ? "Codex" : session.agent == "claude" ? "Claude" : session.agent?.capitalized ?? "Agent"
+        let name = displayName(session.agent)
         let project = session.project?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cwd = session.cwd?.trimmingCharacters(in: .whitespacesAndNewlines)
         if cwd == "/" { return name + " 桌面" }
+        if let cwd, URL(fileURLWithPath: cwd).standardizedFileURL.path == NSHomeDirectory() { return "主目录" }
         if let project, !project.isEmpty, project != "/" { return project }
         if let cwd, !cwd.isEmpty {
             let last = URL(fileURLWithPath: cwd).lastPathComponent
@@ -313,7 +323,7 @@ private struct SessionRow: View {
             guard let cwd = session.cwd, !cwd.isEmpty else { return }
             let url = URL(fileURLWithPath: cwd)
             guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
-            NSWorkspace.shared.open(url)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
         } label: {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 8) {
@@ -349,7 +359,7 @@ private struct SessionRow: View {
                 .background(hovering ? Color.primary.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain).onHover { hovering = $0 }
             .disabled(session.cwd?.isEmpty != false)
-            .accessibilityLabel("\(project)，\(detail)，\(state.0)，内存 \(memoryText(session.mem_mb))，成本 \(format(session.cost_usd, prefix: "$"))\(session.context_pct.map { "，上下文剩余 \(Int($0))%" } ?? "")")
+            .accessibilityLabel("\(project)，\(detail)，\(state.0)，内存 \(memoryText(session.mem_mb))\(session.cost_usd.map { "，成本 " + format($0, prefix: "$") } ?? "")\(session.context_pct.map { "，上下文剩余 \(Int($0))%" } ?? "")")
             .accessibilityHint("在 Finder 打开工作目录")
             .help(session.cwd ?? "工作目录未知")
     }

@@ -1,5 +1,6 @@
 """Session identity, resource totals and warning regressions without live processes."""
 import json
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,7 +68,8 @@ class AggregationTests(unittest.TestCase):
     def test_snapshot_additions_and_missing_resource(self):
         row = snapshot.session_rows([self.row(mem_mb=None)])[0]
         self.assertEqual(row['project'], 'project')
-        self.assertEqual(row['session_id'], 'pid:1')
+        self.assertIsNone(row['session_id'])
+        self.assertEqual(row['session_key'], 'pid:1')
         self.assertEqual(row['processes'], 1)
         self.assertIsNone(row['mem_mb'])
         with patch.object(agents.subprocess, 'run') as run:
@@ -91,11 +93,11 @@ class AggregationTests(unittest.TestCase):
              patch.object(agents.mcp, 'collect', return_value=[]), \
              patch.object(agents.activity, 'state', return_value={}):
             rows = agents.collect()
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 4)
         desktop = next(r for r in rows if r['pid'] == 10)
-        self.assertEqual(desktop['processes'], 4)
-        self.assertEqual(desktop['mem_mb'], 400)
-        self.assertEqual(desktop['pids'], [10, 11, 12, 13])
+        self.assertEqual(desktop['processes'], 2)
+        self.assertEqual(desktop['mem_mb'], 200)
+        self.assertEqual(desktop['pids'], [10, 11])
 
     def test_collect_claims_logs_once_and_folds_helper_resources(self):
         procs = {1: {'path': '/bin/codex', 'comm': 'codex', 'ppid': 0},
@@ -103,8 +105,8 @@ class AggregationTests(unittest.TestCase):
                  3: {'path': '/bin/codex', 'comm': 'codex', 'ppid': 0}}
         data = dict(model='gpt', input_tokens=2, output_tokens=1,
                     cache_create_tokens=0, cache_read_tokens=0)
-        index = {'codex': [dict(path='/a', session_id='a', cwd='/work', data=data, mtime=1),
-                           dict(path='/b', session_id='b', cwd='/work', data=data, mtime=1)]}
+        index = {'codex': [dict(path='/a', session_id='a', cwd='/work', data=data, mtime=time.time()),
+                           dict(path='/b', session_id='b', cwd='/work', data=data, mtime=time.time())]}
         with patch.object(agents.procstat, 'scan_processes', return_value=procs), \
              patch.object(agents.procstat, 'load_cwds', return_value={p: '/work' for p in procs}), \
              patch.object(agents, 'build_index', return_value=index), \

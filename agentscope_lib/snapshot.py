@@ -164,6 +164,7 @@ def session_rows(sessions):
         rows.append({
             'pid': record.get('pid'),
             'session_id': record.get('session_id'),
+            'session_key': record.get('session_key'),
             'project': record.get('project'),
             'processes': record.get('processes'),
             'agent': record.get('agent_type'),
@@ -192,7 +193,7 @@ def totals(sessions, rows=None):
 def alert_rows(alerts):
     from . import agents
     return [{'count': item.get('count'), 'pids': item.get('pids'),
-             'level': item.get('level'), 'kind': item.get('kind'),
+             'cwds': item.get('cwds'), 'level': item.get('level'), 'kind': item.get('kind'),
              'pid': item.get('pid'), 'msg': item.get('msg')} for item in agents.aggregate_alerts(alerts)]
 
 

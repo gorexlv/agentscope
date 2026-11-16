@@ -15,10 +15,11 @@ class Notifier:
         now = time.monotonic()
         cooldown = cfg['cooldown_minutes'] * 60
         self.sent = {k: t for k, t in self.sent.items() if now - t < cooldown}
-        for alert in alerts:
+        per_session = [member for alert in alerts for member in (alert.get("session_alerts") or [alert])]
+        for alert in per_session:
             if alert['kind'] not in ('CONTEXT_LOW', 'MEM_HIGH', 'WATCH_CLEANED', 'WORKTREE_SUMMARY'):
                 continue
-            key = (alert.get('pid'), alert['kind'])
+            key = (alert.get('session_id') or alert.get('session_key') or f"pid:{alert.get('pid')}", alert['kind'])
             if key in self.sent:
                 continue
             try:

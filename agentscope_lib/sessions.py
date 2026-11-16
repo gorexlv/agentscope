@@ -165,6 +165,19 @@ def format_tokens(n):
 
 # ── Claude Code ────────────────────────────────────────────────
 
+def claude_context_limit(model):
+    """Infer only recognized Claude models; explicit caller limits take precedence."""
+    if not model or not model.startswith("claude-"):
+        return None
+    # https://platform.claude.com/docs/en/build-with-claude/context-windows
+    million = ("claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+               "claude-sonnet-4-6", "claude-sonnet-5", "claude-haiku-5-5",
+               "claude-fable-5", "claude-mythos-5", "claude-mythos-preview")
+    if "[1m]" in model.lower() or any(model == name or model.startswith(name + "-") for name in million):
+        return 1_000_000
+    return DEFAULT_CONTEXT_LIMIT
+
+
 def parse_claude_session(path, context_limit=None):
     """解析 Claude Code 会话文件尾部，取最近一次 assistant 的 usage"""
     from .procstat import read_file_tail
@@ -210,14 +223,16 @@ def parse_claude_session(path, context_limit=None):
             cr = usage.get("cache_read_input_tokens") or 0
             out = usage.get("output_tokens") or 0
             used = inp + cc + cr
+            limit = context_limit if context_limit is not None else claude_context_limit(model)
             result.update({
                 "input_tokens": inp,
                 "output_tokens": out,
                 "cache_create_tokens": cc,
                 "cache_read_tokens": cr,
                 "context_used": used,
-                "context_pct": (max(0, min(100, round((context_limit - used) / context_limit * 100)))
-                                if context_limit and context_limit > 0 else None),
+                "context_limit": limit,
+                "context_pct": (max(0, min(100, round((limit - used) / limit * 100)))
+                                if limit and limit > 0 else None),
                 "model": model,
                 "stop_reason": msg.get("stop_reason"),
                 "git_branch": d.get("gitBranch"),

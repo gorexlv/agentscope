@@ -276,9 +276,9 @@ def cmd_whoami(args):
     found = None
     confidence = "none"
 
-    for s in sess:
-        if s["pid"] in chain:
-            found = s
+    for ancestor in chain:
+        found = next((s for s in sess if ancestor in (s.get("pids") or [s["pid"]])), None)
+        if found:
             confidence = "ppid"
             break
 
