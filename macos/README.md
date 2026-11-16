@@ -39,3 +39,21 @@ swift run --package-path macos/AgentscopeBar AgentscopePreview \
 仅当多个独立进程共享同一 cwd 时，日志消歧才排除超过两小时未更新的候选；单个 Claude 会话保留原有匹配方式，长时间空闲仍可触发 IDLE。每个独立进程只能认领一个未占用日志，有进程启动时间和文件创建时间时按接近程度配对。这是启发式归属，不代替明确的进程到日志绑定。
 
 后续改进：为慢速目录的 git 顶层查询增加有失效机制的缓存；增强恢复会话的显式日志绑定；补充原生滚动、设置、Finder 和 VoiceOver 实机验收。
+
+## 桌面浮窗
+
+在菜单栏面板的齿轮菜单中开启“桌面浮窗”，再通过“浮窗尺寸”选择小或中；默认关闭。小尺寸为 280×184pt，显示负载、内存和告警数；中尺寸为 340×440pt，增加会话数与已知成本、最多三个会话、可回收空间、更新时间和连接状态。浮窗复用菜单栏卡片与会话行，直接观察同一个模型，沿用同一刷新间隔，不创建额外轮询。
+
+浮窗只读，没有清理、Finder 或终端按钮；点击任意位置打开菜单栏面板，拖动可移动。开关、尺寸和位置保存在 UserDefaults。切换尺寸保持左上角位置，显示器移除或分辨率变化后会把窗口夹回可见区域；异常小的显示区域会缩小显示内容，显示器暂时不可用时保留已有位置。
+
+窗口使用不激活的无边框 NSPanel，层级为桌面图标层加一，低于普通应用窗口；加入所有空间，以 stationary / ignoresCycle 排除普通 Mission Control 窗口排列与窗口轮换。应用保持 accessory 模式，不新增 Dock 或 ⌘Tab 项。菜单栏改用 NSStatusItem + NSPopover 承载原有 SwiftUI 内容，使浮窗点击通过公开 AppKit 接口打开同一个面板；不依赖 WidgetKit、App Group 或付费签名。
+
+渲染小/中 × 浅/深四张真实数据预览：
+
+```sh
+bin/agentscope snapshot --json > /tmp/agentscope-real.json
+swift run --package-path macos/AgentscopeBar AgentscopePreview \
+  /tmp/agentscope-real.json '/tmp/preview-panel-{size}-{appearance}' offline desktop
+```
+
+预览只绘制共享内容，不创建或显示 NSPanel，不修改 UserDefaults。尺寸切换和跨屏位置恢复有纯逻辑测试；窗口层级、拖动、点击弹出、空间切换以及 VoiceOver 的真实交互仍需运行应用后验收。

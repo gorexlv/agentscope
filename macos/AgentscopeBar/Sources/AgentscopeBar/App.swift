@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 import AgentscopeUI
 import ServiceManagement
 import AgentscopeCore
@@ -15,6 +16,12 @@ final class AppModel: ObservableObject {
     @Published var lastError: String?
     @Published var loginEnabled = SMAppService.mainApp.status == .enabled
     @Published var refreshInterval = 5.0
+    @Published var desktopEnabled = UserDefaults.standard.bool(forKey: "desktopPanelEnabled") {
+        didSet { UserDefaults.standard.set(desktopEnabled, forKey: "desktopPanelEnabled") }
+    }
+    @Published var desktopSize = DesktopPanelSize(savedValue: UserDefaults.standard.string(forKey: "desktopPanelSize")) {
+        didSet { UserDefaults.standard.set(desktopSize.rawValue, forKey: "desktopPanelSize") }
+    }
     private var interval: Double {
         let saved = UserDefaults.standard.double(forKey: "refreshInterval")
         return [2.0, 5.0, 15.0].contains(saved) ? saved : 5
@@ -43,7 +50,8 @@ final class AppModel: ObservableObject {
     func actions() -> PanelActions {
         PanelActions(clean: { self.cleanOrphans() }, worktrees: { self.worktrees() },
                      panel: { self.panel() }, quit: { NSApp.terminate(nil) },
-                     login: { self.toggleLogin() }, interval: { seconds in
+                     login: { self.toggleLogin() }, desktopToggle: { self.desktopEnabled.toggle() },
+                     desktopSize: { self.desktopSize = $0 }, interval: { seconds in
                          UserDefaults.standard.set(seconds, forKey: "refreshInterval")
                          self.refreshInterval = seconds; self.schedule()
                      })
@@ -114,33 +122,86 @@ final class AppModel: ObservableObject {
         }
     }
 }
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+
+private struct MenuPanelContent: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        PanelView(snapshot: model.snapshot, online: model.online, cleaning: model.cleaning,
+                  error: model.lastError, interval: model.refreshInterval,
+                  loginEnabled: model.loginEnabled, desktopEnabled: model.desktopEnabled,
+                  desktopSize: model.desktopSize, actions: model.actions())
     }
 }
+
+private struct StatusLabel: View {
+    @ObservedObject var model: AppModel
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "gauge.with.dots.needle.33percent")
+                .foregroundStyle(model.snapshot?.hasWarning == true ? Color.orange : Color.primary)
+            Text(model.snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "—").monospacedDigit()
+            let count = model.snapshot?.alerts?.filter { $0.level == "warn" }.count ?? 0
+            if count > 0 {
+                Text("\(count)").font(.caption2.bold()).padding(.horizontal, 4)
+                    .background(.orange.opacity(0.2), in: Capsule())
+            }
+        }.padding(.horizontal, 6).fixedSize()
+    }
+}
+private final class StatusHostingView: NSHostingView<StatusLabel> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var model: AppModel!
+    private var statusItem: NSStatusItem!
+    private let popover = NSPopover()
+    private var desktop: DesktopPanelController?
+    private var statusObservation: AnyCancellable?
+    private var statusView: StatusHostingView!
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        model = AppModel()
+        statusItem = NSStatusBar.system.statusItem(withLength: 76)
+        guard let button = statusItem.button else { return }
+        button.target = self; button.action = #selector(togglePopover)
+        button.setAccessibilityLabel("agentscope 系统负载与告警")
+        statusView = StatusHostingView(rootView: StatusLabel(model: model))
+        button.addSubview(statusView)
+        updateStatus()
+        statusObservation = model.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateStatus() }
+        }
+        let content = NSHostingController(rootView: MenuPanelContent(model: model))
+        content.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = content
+        popover.contentSize = NSSize(width: 340, height: 560)
+        popover.behavior = .transient
+        desktop = DesktopPanelController(model: model, openPanel: { [weak self] in self?.showPopover() })
+    }
+    private func updateStatus() {
+        let width = max(54, statusView.fittingSize.width)
+        statusItem.length = width
+        statusView.frame = NSRect(x: 0, y: 0, width: width, height: NSStatusBar.system.thickness)
+        let warnings = model.snapshot?.alerts?.filter { $0.level == "warn" }.count ?? 0
+        statusItem.button?.setAccessibilityValue("负载 \(model.snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "未知")，\(warnings) 类警告")
+    }
+    @objc private func togglePopover() {
+        if popover.isShown { popover.performClose(nil) } else { showPopover() }
+    }
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        if !popover.isShown { popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY) }
+    }
+}
+
 @main
-struct AgentscopeBarApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    @StateObject private var model = AppModel()
-    var body: some Scene {
-        MenuBarExtra {
-            PanelView(snapshot: model.snapshot, online: model.online, cleaning: model.cleaning,
-                      error: model.lastError, interval: model.refreshInterval,
-                      loginEnabled: model.loginEnabled, actions: model.actions())
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "gauge.with.dots.needle.33percent")
-                    .foregroundStyle(model.snapshot?.hasWarning == true ? Color.orange : Color.primary)
-                Text(model.snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "—")
-                    .monospacedDigit()
-                let count = model.snapshot?.alerts?.filter { $0.level == "warn" }.count ?? 0
-                if count > 0 {
-                    Text("\(count)").font(.caption2.bold()).padding(.horizontal, 4)
-                        .background(.orange.opacity(0.2), in: Capsule())
-                        .accessibilityLabel("\(count) 类警告")
-                }
-            }.accessibilityLabel("agentscope 系统负载与告警")
-        }.menuBarExtraStyle(.window)
+enum AgentscopeBarMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.setActivationPolicy(.accessory)
+        app.delegate = delegate
+        withExtendedLifetime(delegate) { app.run() }
     }
 }

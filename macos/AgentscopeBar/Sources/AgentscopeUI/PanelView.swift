@@ -8,12 +8,16 @@ public struct PanelActions {
     public var panel: () -> Void
     public var quit: () -> Void
     public var login: () -> Void
+    public var desktopToggle: () -> Void
+    public var desktopSize: (DesktopPanelSize) -> Void
     public var interval: (Double) -> Void
     public init(clean: @escaping () -> Void = {}, worktrees: @escaping () -> Void = {},
                 panel: @escaping () -> Void = {}, quit: @escaping () -> Void = {},
-                login: @escaping () -> Void = {}, interval: @escaping (Double) -> Void = { _ in }) {
+                login: @escaping () -> Void = {}, desktopToggle: @escaping () -> Void = {},
+                desktopSize: @escaping (DesktopPanelSize) -> Void = { _ in }, interval: @escaping (Double) -> Void = { _ in }) {
         self.clean = clean; self.worktrees = worktrees; self.panel = panel
         self.quit = quit; self.login = login; self.interval = interval
+        self.desktopToggle = desktopToggle; self.desktopSize = desktopSize
     }
 }
 
@@ -37,6 +41,8 @@ public struct PanelView: View {
     public var cleaning: Bool
     public var error: String?
     public var interval: Double
+    public var desktopEnabled: Bool
+    public var desktopSize: DesktopPanelSize
     public var loginEnabled: Bool
     public var actions: PanelActions
     public var rendering: Bool
@@ -45,9 +51,11 @@ public struct PanelView: View {
     @State private var allAlerts = false
 
     public init(snapshot: Snapshot?, online: Bool, cleaning: Bool = false, error: String? = nil,
-                interval: Double = 5, loginEnabled: Bool = false, actions: PanelActions = PanelActions(),
+                interval: Double = 5, loginEnabled: Bool = false,
+                desktopEnabled: Bool = false, desktopSize: DesktopPanelSize = .small, actions: PanelActions = PanelActions(),
                 now: Date = Date(), rendering: Bool = false) {
         self.snapshot = snapshot; self.online = online; self.cleaning = cleaning; self.error = error
+        self.desktopEnabled = desktopEnabled; self.desktopSize = desktopSize
         self.rendering = rendering
         self.interval = interval; self.loginEnabled = loginEnabled; self.actions = actions; self.now = now
     }
@@ -137,6 +145,15 @@ public struct PanelView: View {
                     if loginEnabled { Label("登录时启动", systemImage: "checkmark") }
                     else { Text("登录时启动") }
                 }
+                Toggle("桌面浮窗", isOn: Binding(get: { desktopEnabled }, set: { _ in actions.desktopToggle() }))
+                Menu("浮窗尺寸") {
+                    ForEach(DesktopPanelSize.allCases, id: \.self) { size in
+                        Button { actions.desktopSize(size) } label: {
+                            if size == desktopSize { Label(size.title, systemImage: "checkmark") }
+                            else { Text(size.title) }
+                        }
+                    }
+                }
                 Button("打开面板", action: actions.panel)
                 Divider()
                 Button("退出 agentscope", action: actions.quit)
@@ -158,56 +175,7 @@ public struct PanelView: View {
         formatter.unitsStyle = .full
         return "更新于 " + formatter.localizedString(for: parsed, relativeTo: date)
     }
-    private var overview: some View {
-        HStack(spacing: 8) {
-            metric("负载", value: snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "—",
-                   progress: loadProgress, symbol: "gauge.with.dots.needle.33percent")
-            metric("内存", value: snapshot?.host?.mem_used_pct.map { String(format: "%.0f%%", $0) } ?? "—",
-                   progress: snapshot?.host?.mem_used_pct.map { $0 / 100 }, symbol: "memorychip")
-            VStack(spacing: 6) {
-                Image(systemName: "square.stack.3d.up").font(.title3).frame(height: 24).foregroundStyle(Color.secondary)
-                Text(snapshot?.sessions.map { String($0.count) } ?? "—").font(.title3).monospacedDigit()
-                Text("会话").font(.caption).foregroundStyle(Color.secondary)
-                Text(costSummary)
-                    .font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
-                    .accessibilityLabel(costAccessibility)
-            }.frame(maxWidth: .infinity).padding(.vertical, 12)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
-        }
-    }
-    private var costSummary: String {
-        if let today = snapshot?.totals?.today_cost_usd { return "今日 " + format(today, prefix: "$") }
-        let known = sessions.compactMap(\.cost_usd).filter(\.isFinite)
-        return known.isEmpty ? "成本未知" : format(known.reduce(0, +), prefix: "$")
-    }
-    private var costAccessibility: String {
-        snapshot?.totals?.today_cost_usd == nil ? "已知会话成本合计，" + costSummary : costSummary
-    }
-    private var loadProgress: Double? {
-        guard let load = snapshot?.host?.load1, let cores = snapshot?.host?.ncpu, cores > 0 else { return nil }
-        return load / Double(cores)
-    }
-    private func metric(_ title: String, value: String, progress: Double?, symbol: String) -> some View {
-        VStack(spacing: 6) {
-            ZStack {
-                Circle().stroke(.quaternary, lineWidth: 3)
-                if let progress {
-                    Circle().trim(from: 0, to: min(1, max(0, progress)))
-                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                }
-                Image(systemName: symbol).font(.system(size: 10)).foregroundStyle(Color.secondary)
-            }.frame(width: 24, height: 24).accessibilityHidden(true)
-            Text(value).font(.title3).monospacedDigit()
-            Text(title).font(.caption).foregroundStyle(Color.secondary)
-            Text(title == "负载" ? "\(snapshot?.host?.ncpu.map(String.init) ?? "—") 核心" : "已使用")
-                .font(.caption2).foregroundStyle(Color.secondary)
-        }.frame(maxWidth: .infinity).padding(.vertical, 12)
-            .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
-            .accessibilityElement(children: .ignore).accessibilityLabel("\(title) \(value)")
-    }
+    private var overview: some View { OverviewCards(snapshot: snapshot) }
     private var attention: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("需要关注").font(.subheadline.weight(.semibold))
@@ -281,7 +249,8 @@ public struct PanelView: View {
     }
 }
 
-private struct SessionRow: View {
+struct SessionRow: View {
+    var readOnly = false
     let session: Snapshot.Session
     @State private var hovering = false
     private var project: String {
@@ -318,49 +287,114 @@ private struct SessionRow: View {
         default: return ("状态未知", .gray)
         }
     }
+    @ViewBuilder var body: some View {
+        if readOnly {
+            content.accessibilityElement(children: .combine).accessibilityValue(state.0)
+        } else {
+            Button {
+                guard let cwd = session.cwd, !cwd.isEmpty else { return }
+                let url = URL(fileURLWithPath: cwd)
+                guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } label: {
+                content
+            }.buttonStyle(.plain).onHover { hovering = $0 }
+                .disabled(session.cwd?.isEmpty != false)
+                .accessibilityLabel("\(project)，\(detail)，\(state.0)，内存 \(memoryText(session.mem_mb))\(session.cost_usd.map { "，成本 " + format($0, prefix: "$") } ?? "")\(session.context_pct.map { "，上下文剩余 \(Int($0))%" } ?? "")")
+                .accessibilityHint("在 Finder 打开工作目录")
+                .help(session.cwd ?? "工作目录未知")
+        }
+    }
+    private var content: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: symbol).font(.body).foregroundStyle(Color.secondary).frame(width: 20)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(project).font(.body).lineLimit(1).truncationMode(.middle)
+                    if !detail.isEmpty {
+                        Text(detail).font(.caption).foregroundStyle(Color.secondary).lineLimit(1)
+                    }
+                }
+                Spacer(minLength: 0)
+                VStack(alignment: .trailing, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Circle().fill(state.1).frame(width: 6, height: 6)
+                        Text(memoryText(session.mem_mb)).font(.caption).monospacedDigit()
+                    }
+                    if let cost = session.cost_usd {
+                        Text(format(cost, prefix: "$")).font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
+                    }
+                }
+            }
+            if let context = session.context_pct {
+                GeometryReader { geometry in
+                    Capsule().fill(.quaternary)
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(context <= 20 ? Color.orange : Color.accentColor)
+                                .frame(width: geometry.size.width * min(1, max(0, context / 100)))
+                        }
+                }.frame(height: 3)
+                    .accessibilityLabel("上下文剩余 \(Int(context))%")
+            }
+        }.padding(.horizontal, 8).padding(.vertical, 6).contentShape(RoundedRectangle(cornerRadius: 8))
+            .background(hovering ? Color.primary.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 8))
+
+    }
+}
+
+struct OverviewCards: View {
+    let snapshot: Snapshot?
+    var includeSessions = true
     var body: some View {
-        Button {
-            guard let cwd = session.cwd, !cwd.isEmpty else { return }
-            let url = URL(fileURLWithPath: cwd)
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        } label: {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Image(systemName: symbol).font(.body).foregroundStyle(Color.secondary).frame(width: 20)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(project).font(.body).lineLimit(1).truncationMode(.middle)
-                        if !detail.isEmpty {
-                            Text(detail).font(.caption).foregroundStyle(Color.secondary).lineLimit(1)
-                        }
-                    }
-                    Spacer(minLength: 0)
-                    VStack(alignment: .trailing, spacing: 3) {
-                        HStack(spacing: 5) {
-                            Circle().fill(state.1).frame(width: 6, height: 6)
-                            Text(memoryText(session.mem_mb)).font(.caption).monospacedDigit()
-                        }
-                        if let cost = session.cost_usd {
-                            Text(format(cost, prefix: "$")).font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
-                        }
-                    }
+        HStack(spacing: 8) {
+            metric("负载", value: snapshot?.host?.load1.map { String(format: "%.1f", $0) } ?? "—",
+                   progress: loadProgress, symbol: "gauge.with.dots.needle.33percent")
+            metric("内存", value: snapshot?.host?.mem_used_pct.map { String(format: "%.0f%%", $0) } ?? "—",
+                   progress: snapshot?.host?.mem_used_pct.map { $0 / 100 }, symbol: "memorychip")
+            if includeSessions {
+                VStack(spacing: 6) {
+                    Image(systemName: "square.stack.3d.up").font(.title3).frame(height: 24).foregroundStyle(Color.secondary)
+                    Text(snapshot?.sessions.map { String($0.count) } ?? "—").font(.title3).monospacedDigit()
+                    Text("会话").font(.caption).foregroundStyle(Color.secondary)
+                    Text(costSummary)
+                        .font(.caption2).monospacedDigit().foregroundStyle(Color.secondary)
+                        .accessibilityLabel(costAccessibility)
+                }.frame(maxWidth: .infinity).padding(.vertical, 12)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+            }
+        }
+    }
+    private var costSummary: String {
+        if let today = snapshot?.totals?.today_cost_usd { return "今日 " + format(today, prefix: "$") }
+        let known = (snapshot?.sessions ?? []).compactMap(\.cost_usd).filter(\.isFinite)
+        return known.isEmpty ? "成本未知" : format(known.reduce(0, +), prefix: "$")
+    }
+    private var costAccessibility: String {
+        snapshot?.totals?.today_cost_usd == nil ? "已知会话成本合计，" + costSummary : costSummary
+    }
+    private var loadProgress: Double? {
+        guard let load = snapshot?.host?.load1, let cores = snapshot?.host?.ncpu, cores > 0 else { return nil }
+        return load / Double(cores)
+    }
+    private func metric(_ title: String, value: String, progress: Double?, symbol: String) -> some View {
+        VStack(spacing: 6) {
+            ZStack {
+                Circle().stroke(.quaternary, lineWidth: 3)
+                if let progress {
+                    Circle().trim(from: 0, to: min(1, max(0, progress)))
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
                 }
-                if let context = session.context_pct {
-                    GeometryReader { geometry in
-                        Capsule().fill(.quaternary)
-                            .overlay(alignment: .leading) {
-                                Capsule().fill(context <= 20 ? Color.orange : Color.accentColor)
-                                    .frame(width: geometry.size.width * min(1, max(0, context / 100)))
-                            }
-                    }.frame(height: 3)
-                        .accessibilityLabel("上下文剩余 \(Int(context))%")
-                }
-            }.padding(.horizontal, 8).padding(.vertical, 6).contentShape(RoundedRectangle(cornerRadius: 8))
-                .background(hovering ? Color.primary.opacity(0.05) : .clear, in: RoundedRectangle(cornerRadius: 8))
-        }.buttonStyle(.plain).onHover { hovering = $0 }
-            .disabled(session.cwd?.isEmpty != false)
-            .accessibilityLabel("\(project)，\(detail)，\(state.0)，内存 \(memoryText(session.mem_mb))\(session.cost_usd.map { "，成本 " + format($0, prefix: "$") } ?? "")\(session.context_pct.map { "，上下文剩余 \(Int($0))%" } ?? "")")
-            .accessibilityHint("在 Finder 打开工作目录")
-            .help(session.cwd ?? "工作目录未知")
+                Image(systemName: symbol).font(.system(size: 10)).foregroundStyle(Color.secondary)
+            }.frame(width: 24, height: 24).accessibilityHidden(true)
+            Text(value).font(.title3).monospacedDigit()
+            Text(title).font(.caption).foregroundStyle(Color.secondary)
+            Text(title == "负载" ? "\(snapshot?.host?.ncpu.map(String.init) ?? "—") 核心" : "已使用")
+                .font(.caption2).foregroundStyle(Color.secondary)
+        }.frame(maxWidth: .infinity).padding(.vertical, 12)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.5))
+            .accessibilityElement(children: .ignore).accessibilityLabel("\(title) \(value)")
     }
 }
