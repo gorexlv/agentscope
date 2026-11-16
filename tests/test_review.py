@@ -75,7 +75,8 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(history.read(['kills'])[0]['reason'], 'invalid config')
         self.assertIsNotNone(sessions.pricing_for('gpt-5'))
 
-    def test_watch_disabled_notifications_and_round_recovery(self):
+    @patch('agentscope_lib.worktrees.schedule_weekly_summary')
+    def test_watch_disabled_notifications_and_round_recovery(self, weekly):
         from agentscope_lib import agents
         import types
         with patch.object(cleanup, 'analyze', side_effect=[OSError('transient'), ({}, [])]) as analyze, patch.object(agents, 'collect') as collect, patch.object(cleanup.time, 'sleep', side_effect=[None, KeyboardInterrupt]):
@@ -83,7 +84,8 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(analyze.call_count, 2)
             collect.assert_not_called()
 
-    def test_watch_notification_failure_isolated(self):
+    @patch('agentscope_lib.worktrees.schedule_weekly_summary')
+    def test_watch_notification_failure_isolated(self, weekly):
         from agentscope_lib import agents
         import types
         Path(os.environ['AGENTSCOPE_CONFIG']).write_text('{"notify":{"enabled":true}}')

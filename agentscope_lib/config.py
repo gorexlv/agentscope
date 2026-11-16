@@ -1,4 +1,5 @@
 """Validated user configuration; invalid safety settings fail closed."""
+import glob
 import fnmatch
 import json
 import math
@@ -16,6 +17,7 @@ def _parse_config(path, data=None):
            ('Workspace', 'Worksapce', 'Workbuddy', 'orca/workspaces', '.codex/worktrees',
             '.claude', 'Desktop', 'Documents', 'Projects')],
            'protect': {'comm': [name + '*' for name in DEFAULT_PROTECT], 'cmdline': ['*/' + name.removesuffix('.app') + '.app/*' for name in DEFAULT_PROTECT], 'cwd': []},
+           'worktrees': {'idle_days': 30, 'stale_days': 60, 'protect': []},
            'notify': {'enabled': False, 'cooldown_minutes': 15}, 'pricing': {}}
     if data is None:
         try:
@@ -30,7 +32,7 @@ def _parse_config(path, data=None):
             if not isinstance(data[k], list) or not all(isinstance(v, str) and v for v in data[k]):
                 raise ValueError(k + ' must be a list of nonempty strings')
             cfg[k] = data[k]
-    for k in ('protect', 'notify', 'pricing'):
+    for k in ('protect', 'notify', 'pricing', 'worktrees'):
         if k in data:
             if not isinstance(data[k], dict):
                 raise ValueError(k + ' must be an object')
@@ -38,6 +40,13 @@ def _parse_config(path, data=None):
     for k, values in cfg['protect'].items():
         if k not in ('comm', 'cmdline', 'cwd') or not isinstance(values, list) or not all(isinstance(v, str) and v for v in values):
             raise ValueError('protect fields must be string lists: comm/cmdline/cwd')
+    w = cfg['worktrees']
+    for key in ('idle_days', 'stale_days'):
+        if isinstance(w[key], bool) or not isinstance(w[key], (int, float)) or not math.isfinite(w[key]) or w[key] < 0:
+            raise ValueError('invalid worktrees threshold')
+    if not isinstance(w['protect'], list) or not all(isinstance(p, str) and p for p in w['protect']):
+        raise ValueError('worktrees.protect must be a path list')
+    w['protect'] = [os.path.realpath(os.path.expanduser(p)) for p in w['protect']]
     n = cfg['notify']
     if not isinstance(n['enabled'], bool) or isinstance(n['cooldown_minutes'], bool) or not isinstance(n['cooldown_minutes'], (int, float)) or not math.isfinite(n['cooldown_minutes']) or n['cooldown_minutes'] < 0:
         raise ValueError('invalid notify configuration')
@@ -47,6 +56,8 @@ def _parse_config(path, data=None):
     env = os.environ.get('AGENTSCOPE_WORKSPACES', '').strip()
     if env:
         cfg['workspaces'] = [p for p in env.split(os.pathsep) if p]
+    if 'workspaces' not in data and not env:
+        cfg['workspaces'].extend(glob.glob(os.path.expanduser('~/multica_workspaces*')))
     cfg['workspaces'] = [os.path.realpath(os.path.expanduser(p)) for p in cfg['workspaces']]
     return cfg
 

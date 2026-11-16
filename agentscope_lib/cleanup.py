@@ -684,6 +684,11 @@ def cmd_watch(args):
                     metrics.write(metrics.sample(info, units))
                 except Exception as error:
                     print(f'metrics failed: {error}', file=sys.stderr)
+                try:
+                    from agentscope_lib import worktrees
+                    worktrees.schedule_weekly_summary(notifier, cfg)
+                except Exception as error:
+                    print(f'worktree summary failed: {error}', file=sys.stderr)
                 if not cfg['valid']:
                     audit('kills', {'mode': 'watch', 'pgid': None, 'members': [], 'result': 'skipped', 'reason': 'invalid config'})
                 if cfg['notify']['enabled']:

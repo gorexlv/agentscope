@@ -360,7 +360,7 @@ RSS 与 footprint 的物理内存统计口径不同；采集不全时标为 part
 单次盘点预算 8 秒，超时输出 complete=false 或 size_complete=false，不把部分大小当完整大小。
 历史会话里已删除的目录、Git worktree 的失效 gitdir 元数据也会列出；后者只建议检查 git worktree prune --dry-run。
 `disk --clean /absolute/worktree/node_modules --yes` 才会删除明确选中的生成目录：
-禁止符号链接、工作区根或非白名单目录，并重新检查相关进程；仍有进程使用工作区或 cwd 无法完整采集时跳过。
+禁止工作区根或非白名单目录，并重新检查相关进程；有项目标记且被 Git 忽略的产物符号链接只 unlink 链接本身；仍有进程使用工作区或 cwd 无法完整采集时跳过。
 磁盘清理不会杀进程，审计记录在 kills.jsonl 的 disk 模式。检查与文件删除之间仍有非原子竞态，请先停止工作区任务。
 
 重任务用默认 `/tmp/agentscope-heavy.lock` 的 flock 在同机协作实例之间排队，
@@ -389,3 +389,62 @@ target 要求 Cargo.toml 或 pom.xml，build 也接受 build.gradle/build.gradle
 包装进程被终止后，子命令持有的 fd 会让锁保持到子命令退出；若子命令主动关闭所有非标准 fd，这种保证不再成立。
 排队是轮询竞争，不保证 FIFO；子命令退出或异常时 fd 关闭并释放锁，不删除锁文件。
 Claude Code 也可能把凭据存放在 macOS Keychain，doctor 的 missing 只代表未找到本地凭据文件，不代表未登录。
+
+### Worktree 与陈旧仓库回收
+
+```sh
+agentscope worktrees --json
+agentscope worktrees --online              # 显式通过 gh 查询 PR
+agentscope worktrees --fetch               # 显式刷新远端引用
+agentscope worktrees clean                 # 默认仅预演
+agentscope worktrees clean --include worktrees,prune,branches,slim --yes
+```
+
+默认从配置工作区（包括 ~/orca/workspaces、~/.codex/worktrees、~/multica_workspaces*）
+发现 Git 仓库，再以 `git worktree list --porcelain -z` 盘点所有登记路径，包括根之外的 linked worktree。
+输出 items、branches、artifacts 和 summary；category 为 worktrees（可删）、slim（只瘦身）、manual（需人工）、prune（失效登记）。
+本地分支另列 branches。每项 reasons 给出拒绝原因，未知进程 cwd 或 Git 查询失败均拒绝删除。
+默认总预算 90 秒，可用 `--budget N` 调整；按仓库四线程并发，先采集证据，仅留最多 2 秒余量给大小；超时 `complete=false`，大小不完整会标 `size_complete=false`，不要把部分盘点理解成全机总量。
+路径和根目录 mtime 对应的大小缓存保留最多 24 小时，`size_cached=true` 表示估计值，嵌套文件变化可能尚未反映。
+
+配置文件可增加：
+
+```json
+{"worktrees": {"idle_days": 30, "stale_days": 60, "protect": ["~/Projects/keep"]}}
+```
+
+`--days N` 临时覆盖 idle_days；protect 为路径及其子树，包含保护路径的祖先 worktree 也不会删除。
+现有 protect.cwd 规则同样生效。最后活动取源码目录/文件 mtime 与 worktree HEAD reflog mtime 的较新值，
+不扫描依赖及 Git 对象内部；这是保守的本地活动估计，并非完整会话历史。
+
+删除 worktree 必须同时满足：非主目录、存在、干净（含未跟踪文件及下述 ignored 检查）、无本地未推送提交、
+已合入 origin 默认分支或对应 HEAD 的 PR 已合并/关闭或达到空闲阈值、无进程使用、未锁定、不受保护。
+默认分支来自本地 origin/HEAD；不存在时合入状态为未知，不猜测 main/master，也不隐式联网。
+未推送按 HEAD 不属于任何远端引用的提交数计算；远端引用可能过期，可自行显式 fetch。
+Squash 合并只能用 --online 的 PR 证据补充。Orca 路径调用 `orca worktree rm`，没有 Orca CLI 则需人工。
+只使用普通 `git worktree remove`、`git worktree prune` 和 `git branch -d`，不用 force、-D 或删除远端分支。
+prune 是整仓操作，因此会重新检查该仓库所有缺失登记，任一个锁定或受保护都拒绝该仓 prune。
+
+陈旧主仓库可以只瘦身，仍要求无改动、无未推送提交和无进程使用；仅选择项目标记匹配、
+没有 Git 跟踪内容的生成目录，实际删除复用 disk.clean 的进程及目录身份检查。
+每个候选在执行前重新查询与检查，结果写 worktrees.jsonl；瘦身另有 kills.jsonl 的 disk 审计。
+进程启动、文件修改与删除之间仍有非原子窗口，清理前应停止相关任务；任何复核拒绝都会保留目标。
+watch 每 7 天盘点并写 worktree-summary.jsonl，通知开启时提醒估计回收量，绝不会自动删除目录或分支。
+
+被 Git 忽略的文件也需要保护。仅放行 node_modules、.venv、dist、build、.next、target
+及 __pycache__、.pytest_cache、.ruff_cache、.mypy_cache 目录里的忽略内容，仍须匹配项目标记文件。
+Python 缓存可匹配同一 worktree 内祖先目录的 pyproject.toml、requirements*.txt 或 setup.py。
+不放行任意缓存目录、CACHEDIR.TAG、独立的 *.pyc 或 .DS_Store 文件。
+其余 ignored 内容（例如 .env、本地文档）一律归 manual，reasons 包含 ignored_files，
+ignored_paths 展示最多五条路径，ignored_count 为 Git 返回的拒绝条目数（忽略目录可能合并成一条）。
+执行前重复检查，不提供强删开关。包含子模块的 worktree 也归 manual。
+Detached HEAD 只有确认合入默认分支才能删除；空闲、远端跟踪引用或 PR 状态都不能替代合入证据。
+瘦身不会穿过嵌套仓库/worktree，生成目录内部包含仓库、被跟踪或有 Git 状态改动时同样拒绝。
+summary.counts.unknown 单列证据不全的数量，是 manual 的子集；不能与其他档相加。
+每周汇总包含 unknown 与 complete，通知在不完整时注明“部分盘点”，回收量不能当作精确趋势。
+watch 内的周盘点在后台守护线程中执行，采用 90 秒预算，主循环不等待；同一状态目录最多一个任务。
+使用墙上时钟记录尝试时间，即使审计或采集失败，也不会在七天内逐轮重试；退出 watch 不等待后台线程。
+仓库检查时间持久化到 worktree-checks.json，下次先检查最久未检查的仓库，降低固定顺序造成的饥饿。
+本地分支用 for-each-ref --merged 批量判断；已合入分支必然有远端可达证据，未合入分支的 unpushed 留空且拒绝删除。
+主仓库中的 .env 等 ignored 内容不阻断瘦身，它们始终保留；只有明确产物候选能被删。
+符号链接产物只计链接自身的磁盘大小，显式清理也只 unlink；即使目标位于工作区外，目标内容不会被遍历或删除。

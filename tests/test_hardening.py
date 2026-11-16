@@ -212,7 +212,8 @@ class HardeningTests(unittest.TestCase):
             self.assertEqual([c.args[0] for c in kill.call_args_list], [101, 100])
         self.assertEqual([r['result'] for r in history.read(['kills'])], ['attempt', 'cleaned'])
 
-    def test_watch_dedup_and_dry_run_notification(self):
+    @patch('agentscope_lib.worktrees.schedule_weekly_summary')
+    def test_watch_dedup_and_dry_run_notification(self, weekly):
         g = self.classify()
         args = types.SimpleNamespace(interval=1, keep_ports=True, dry_run=True)
         with contextlib.ExitStack() as stack:
