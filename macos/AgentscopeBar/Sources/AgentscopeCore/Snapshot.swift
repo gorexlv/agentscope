@@ -51,14 +51,20 @@ public struct Reply: Decodable {
     public struct Skipped: Decodable { public var pgid: Int?; public var reason: String? }
 }
 public func cleanupFailureMessage(_ error: Error) -> (title: String, detail: String) {
-    if error.localizedDescription.contains("正忙") {
-        return ("清理未执行", "\(error.localizedDescription)\ndaemon 正忙，未执行。请重新预演。")
+    if case ClientError.busy = error {
+        return ("清理未执行", "daemon 正忙，未执行。请重新预演。")
     }
     return ("未取得清理结果", "\(error.localizedDescription)\n请求可能已执行，请刷新查看；不会自动重试。")
 }
 public enum ClientError: Error, LocalizedError {
+    case busy
     case message(String)
-    public var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
+    public var errorDescription: String? {
+        switch self {
+        case .busy: return "daemon 正忙，请稍后重试"
+        case .message(let text): return text
+        }
+    }
 }
 public struct CleanupFlow {
     public enum State: Equatable { case idle, previewing, awaitingConfirmation(String, Date), executing, finished }

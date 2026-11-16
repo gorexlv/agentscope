@@ -54,7 +54,7 @@ final class CoreTests: XCTestCase {
         XCTAssertThrowsError(try flow.confirm())
     }
     func testBusyFailureDiffersFromUnknownExecutionOutcome() {
-        let busy = cleanupFailureMessage(ClientError.message("daemon 正忙，请稍后重试"))
+        let busy = cleanupFailureMessage(ClientError.busy)
         XCTAssertEqual(busy.title, "清理未执行")
         XCTAssertTrue(busy.detail.contains("daemon 正忙，未执行。请重新预演。"))
         XCTAssertFalse(busy.detail.contains("可能已执行"))

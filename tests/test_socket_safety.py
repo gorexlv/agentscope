@@ -38,8 +38,10 @@ class SocketSafetyTests(DaemonTestCase):
     def test_cache_freshness_and_live_fallback(self):
         cached = {'groups': [fake_group(101)], 'monotonic': time.monotonic(), 'as_of': 'cached-time'}
         server = self.make_server(clean_cache=lambda: cached, daemon_info={'interval_s': 1})
-        with patch.object(cleanup, 'analyze', side_effect=AssertionError('unexpected full scan')):
+        with patch.object(cleanup, 'analyze', side_effect=AssertionError('unexpected full scan')), \
+             patch.object(server, '_fresh_cache', wraps=server._fresh_cache) as fresh:
             response = server.dispatch({'op': 'clean', 'dry_run': True})
+        fresh.assert_called_once_with()
         self.assertEqual(response['source'], 'cache')
         self.assertEqual(response['as_of'], 'cached-time')
         self.assertEqual(response['targets'][0]['pgid'], 101)

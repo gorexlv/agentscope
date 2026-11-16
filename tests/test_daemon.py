@@ -359,7 +359,7 @@ class WatchTests(DaemonTestCase):
 
     def test_20_snapshot_failure_does_not_break_round(self):
         args = type('Args', (), {'dry_run': True, 'interval': 30})()
-        state = {'daemon': {'pid': os.getpid(), 'version': '1.1.0', 'interval_s': 30,
+        state = {'daemon': {'pid': os.getpid(), 'version': '1.2.0', 'interval_s': 30,
                             'last_clean_at': None}, 'snapshot': None}
         with patch.object(cleanup, 'analyze', return_value=({}, [])), \
                 patch.object(cleanup, 'metrics', create=True), \
@@ -373,7 +373,7 @@ class WatchTests(DaemonTestCase):
 
     def test_21_round_writes_snapshot_file(self):
         args = type('Args', (), {'dry_run': True, 'interval': 30})()
-        state = {'daemon': {'pid': os.getpid(), 'version': '1.1.0', 'interval_s': 30,
+        state = {'daemon': {'pid': os.getpid(), 'version': '1.2.0', 'interval_s': 30,
                             'last_clean_at': None}, 'snapshot': None}
         with patch.object(cleanup, 'analyze', return_value=({}, [])), \
                 patch('agentscope_lib.metrics.write'), \

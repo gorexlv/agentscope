@@ -57,7 +57,10 @@ public struct Client {
             data.append(contentsOf: buffer.prefix(count))
             if let end = data.firstIndex(of: 10) {
                 let reply = try JSONDecoder().decode(Reply.self, from: data[..<end])
-                guard reply.ok == true else { throw ClientError.message(reply.error?.contains("busy") == true ? "daemon 正忙，请稍后重试（不会自动重试清理）" : (reply.error ?? "Daemon 请求失败")) }
+                guard reply.ok == true else {
+                    if reply.error?.contains("busy") == true { throw ClientError.busy }
+                    throw ClientError.message(reply.error ?? "Daemon 请求失败")
+                }
                 return reply
             }
         }

@@ -333,13 +333,14 @@ class SnapshotServer:
             if op == 'snapshot':
                 return {'ok': True, 'snapshot': self.snapshot_provider()}
             if op == 'clean':
-                if request.get('dry_run') is True and self._fresh_cache() is not None:
-                    return self._clean(request)
+                cache = self._fresh_cache() if request.get('dry_run') is True else None
+                if cache is not None:
+                    return self._clean(request, cache)
                 from .cleanup import CLEANUP_LOCK
                 if not CLEANUP_LOCK.acquire(blocking=False):
                     return {'ok': False, 'error': 'busy, retry'}
                 try:
-                    return self._clean(request)
+                    return self._clean(request, cache)
                 finally:
                     CLEANUP_LOCK.release()
         except (TimeoutError, subprocess.TimeoutExpired):
@@ -355,11 +356,10 @@ class SnapshotServer:
             return cache
         return None
 
-    def _clean(self, request):
+    def _clean(self, request, cache=None):
         if type(request.get('dry_run')) is not bool:
             return {'ok': False, 'error': 'dry_run must be a boolean'}
         if request['dry_run']:
-            cache = self._fresh_cache()
             if cache is not None:
                 groups, source, as_of = cache['groups'], 'cache', cache['as_of']
             else:
