@@ -275,7 +275,8 @@ class SocketTests(DaemonTestCase):
                 client.settimeout(1)
                 client.connect(server.path)
                 client.sendall(data)
-                client.shutdown(socket.SHUT_WR)
+                if len(data) < server_mod.MAX_REQUEST:
+                    client.shutdown(socket.SHUT_WR)
                 self.assertFalse(json.loads(client.recv(4096))['ok'])
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(1)

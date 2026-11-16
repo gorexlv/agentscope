@@ -45,7 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return entry
     }
     private func render() {
-        let title = snapshot?.title ?? "L — · ⚠ —"
+        let title = (snapshot?.title ?? "L — · ⚠ —") + (online ? "" : " · ?")
         item.button?.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: snapshot?.hasWarning == true ? NSColor.systemOrange : NSColor.labelColor])
         let menu = NSMenu()
         _ = add(menu, online ? "agentscope · daemon 已连接" : "daemon 未运行")
@@ -66,7 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for alert in alerts { _ = add(menu, "\(alert.level ?? "—") · \(alert.msg ?? "—")") }
         } else { _ = add(menu, "—") }
         menu.addItem(.separator())
-        let count = snapshot?.orphans?.groups
+        let count = snapshot?.orphans?.cleanable_groups
         let clean = add(menu, cleaning ? "正在处理清理请求…" : "清理 \(count.map(String.init) ?? "—") 个孤儿组…", action: #selector(cleanOrphans))
         clean.isEnabled = online && !cleaning && (count ?? 0) > 0
         menu.autoenablesItems = false
@@ -86,7 +86,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.menu = menu
     }
     @objc private func openDirectory(_ sender: NSMenuItem) {
-        if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+        if let path = sender.representedObject as? String {
+            let url = URL(fileURLWithPath: path)
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
     }
     @objc private func changeInterval(_ sender: NSMenuItem) {
         guard let seconds = sender.representedObject as? Int else { return }
@@ -126,7 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard !flow.targets.isEmpty else { flow.cancel(); cleaning = false; render(); message("无需清理", "预演没有发现可清理的孤儿组。"); return }
                     let alert = NSAlert(); alert.alertStyle = .warning
                     alert.messageText = "确认清理 \(flow.targets.count) 个孤儿组？"
-                    alert.informativeText = "以下进程组将被终止。执行前 daemon 会再次校验；预演令牌 60 秒后失效。"
+                    let preview = try result.get()
+                    alert.informativeText = "以下进程组将被终止。执行前 daemon 会再次校验；预演令牌 60 秒后失效。\n来源：\(preview.source ?? "—") · 数据时间：\(preview.as_of ?? "—")\n清理最多等待 30 秒。"
                     let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 520, height: 200))
                     let text = NSTextView(frame: scroll.bounds); text.isEditable = false
                     text.string = flow.targets.map(\.label).joined(separator: "\n\n")

@@ -30,6 +30,8 @@ import signal
 import subprocess
 import sys
 import time
+import threading
+import copy
 
 VERSION = "1.1.0"
 
@@ -47,6 +49,27 @@ from agentscope_lib.notify import Notifier, group_key, expire_seen
 import functools
 import builtins
 print = functools.partial(builtins.print, flush=True)
+
+# Shared by watch metadata collection, watch kills and socket cleanup.
+# Metadata caches are process-global, so scans and revalidation must not overlap.
+CLEANUP_LOCK = threading.RLock()
+
+
+def serialized_cleanup(function):
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        deadline = kwargs.get('deadline')
+        if deadline is None:
+            with CLEANUP_LOCK:
+                return function(*args, **kwargs)
+        if not CLEANUP_LOCK.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise TimeoutError('operation budget exhausted')
+        try:
+            return function(*args, **kwargs)
+        finally:
+            CLEANUP_LOCK.release()
+    return wrapped
+
 
 # ─────────────────────────────────────────────────────────────
 # Agent / 开发工具进程特征
@@ -359,6 +382,7 @@ def classify_group(pgid, members, info, cwd_query=None, ports_query=None, tty_qu
     }
 
 
+@serialized_cleanup
 def analyze(info=None, cfg=None, deadline=None):
     cfg = cfg or load_config()
     global _tty_cache
@@ -375,6 +399,7 @@ def analyze(info=None, cfg=None, deadline=None):
 
     units = []
     for pgid, members in groups.items():
+        remaining(deadline, 1)
         if len(members) < 2:
             continue
         g = classify_group(pgid, members, info, cfg=cfg, tty_query=lambda: set())
@@ -518,6 +543,7 @@ def cleanable(g, info, cfg=None, allow_abandoned=False):
             and not set(g['members']).intersection(my_protected_pids(info, cfg=cfg)))
 
 
+@serialized_cleanup
 def revalidate_group(pgid, cfg, deadline=None):
     """One kernel snapshot, target metadata and ports; never a full analyze per group."""
     info = scan_processes(deadline=deadline)
@@ -532,6 +558,7 @@ def revalidate_group(pgid, cfg, deadline=None):
     return info, g
 
 
+@serialized_cleanup
 def kill_group(pgid, dry_run=False, timeout=6, mode='clean', expected=None,
                deadline=None, outcome=None, allow_abandoned=False):
     """Signal only confirmed identities; audit errors never change cleanup results."""
@@ -688,7 +715,12 @@ def write_daemon_snapshot(info, units, state, sessions=None):
 def watch_round(args, notifier, seen, state):
     """一轮巡检：分析 → 指标 → 清理 → 写快照。外围采集故障不影响清理。"""
     cfg = load_config()
-    info, units = analyze(cfg=cfg)
+    with CLEANUP_LOCK:
+        info, units = analyze(cfg=cfg)
+        eligible = [g for g in units if cleanable(g, info, cfg=cfg)]
+    analyzed_at = time.monotonic()
+    analyzed_iso = datetime.datetime.now().astimezone().isoformat()
+    cleaned_pgids = set()
     expire_seen(seen, units)
     try:
         from agentscope_lib import metrics
@@ -717,6 +749,8 @@ def watch_round(args, notifier, seen, state):
         ok = kill_group(g['pgid'], dry_run=args.dry_run, mode='watch', expected=g, outcome=outcome)
         if ok:
             seen.add(group_key(g))
+        if outcome.get('result') in ('cleaned', 'gone') and not args.dry_run:
+            cleaned_pgids.add(g['pgid'])
         if outcome.get('result') == 'cleaned' and not args.dry_run:
             state['daemon']['last_clean_at'] = datetime.datetime.now().astimezone().isoformat()
             try:
@@ -724,6 +758,9 @@ def watch_round(args, notifier, seen, state):
             except Exception as error:
                 print(f'通知失败: {error}', file=sys.stderr)
         print(f"pgid {g['pgid']}: {outcome.get('result', 'skipped')}")
+    units = [g for g in units if g['pgid'] not in cleaned_pgids]
+    state['clean_cache'] = {'groups': copy.deepcopy([g for g in eligible if g['pgid'] not in cleaned_pgids]),
+                            'monotonic': analyzed_at, 'as_of': analyzed_iso}
     write_daemon_snapshot(info, units, state, sessions=sessions)
     return state
 
@@ -748,7 +785,9 @@ def cmd_watch(args):
                                                load={}, daemon=state['daemon'])
 
         server = server_mod.SnapshotServer(daemon_info=state['daemon'],
-                                           snapshot_provider=_provider)
+                                           snapshot_provider=_provider,
+                                           clean_cache=lambda: state.get('clean_cache'),
+                                           allow_cleanup=not args.dry_run)
         server.start()
         print(f'本地 socket: {server.path}')
     except Exception as error:

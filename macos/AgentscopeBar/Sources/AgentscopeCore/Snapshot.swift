@@ -20,7 +20,7 @@ public struct Snapshot: Decodable {
         }
     }
     public struct Alert: Decodable { public var level: String?; public var msg: String? }
-    public struct Orphans: Decodable { public var groups: Int? }
+    public struct Orphans: Decodable { public var groups: Int?; public var cleanable_groups: Int? }
     public struct Reclaim: Decodable { public var worktrees_gb: Double?; public var removable: Int? }
     public var title: String { "L \(format(host?.load1)) · ⚠ \(alerts.map { String($0.count) } ?? "—")" }
     public var hasWarning: Bool { alerts?.contains { $0.level == "warn" } ?? false }
@@ -40,6 +40,8 @@ public struct Reply: Decodable {
     public var ok: Bool?
     public var error: String?
     public var snapshot: Snapshot?
+    public var source: String?
+    public var as_of: String?
     public var token: String?
     public var targets: [Target]?
     public var cleaned: [Int]?

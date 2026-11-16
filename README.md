@@ -484,7 +484,11 @@ bin/agentscope snapshot
 JSON schema 1 包含 daemon、主机负载、会话状态、成本/token 汇总、告警、孤儿组和可回收空间。
 可回收空间只读取已有 worktree 周报缓存；没有缓存时返回未知值，不触发全量扫描。
 
-socket 使用每连接一行 JSON 请求、一行 JSON 响应，I/O 超时 5 秒。
+socket 使用每连接一行 JSON 请求、一行 JSON 响应；clean 请求预算 30 秒，其余请求 5 秒。
 支持 `ping`、`snapshot` 和两阶段 `clean`：先发送 `{"op":"clean","dry_run":true}`
 取得目标和 token，再显式发送 `{"op":"clean","dry_run":false,"token":"…"}`。
 token 在 60 秒后过期且只可使用一次，执行时复核目标身份和清理条件；审计记录使用 `mode=socket`。
+
+预演优先使用 watch 最近一轮的可清理组缓存（最多保留两个巡检间隔），响应的 `source` / `as_of` 标明数据来源和时间，并显示在 App 确认框中；没有有效缓存时在 30 秒预算内实时分析。执行仅复核 token 中的组及成员身份，不重新全量分析。服务繁忙时返回 `busy, retry`，App 提示稍后重试，不会自动重发清理。
+
+socket 会验证内核提供的对端 UID，拒绝非本人或无法验证的连接；状态目录须归当前用户所有且不可由组/其他用户写入。并发连接最多 8 个，清理与 watch 的扫描/清理共享串行锁。`watch --dry-run` 允许预演，但拒绝 socket 实际清理。菜单“清理 N 个”显示可清理组数，离线标题附加 `?`；会话目录仅在 Finder 定位，不启动目录中的 App bundle。

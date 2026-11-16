@@ -12,6 +12,13 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(snapshot.sessions?.first?.mem_mb, 410)
         XCTAssertEqual(snapshot.reclaim?.removable, 47)
     }
+    func testPreviewMetadataAndCleanableCount() throws {
+        let snapshot = try decode(Snapshot.self, #"{"orphans":{"groups":4,"cleanable_groups":2}}"#)
+        XCTAssertEqual(snapshot.orphans?.cleanable_groups, 2)
+        let reply = try decode(Reply.self, #"{"ok":true,"source":"cache","as_of":"2026-11-16T10:00:00+08:00","token":"t","targets":[]}"#)
+        XCTAssertEqual(reply.source, "cache")
+        XCTAssertEqual(reply.as_of, "2026-11-16T10:00:00+08:00")
+    }
     func testMissingAndNullFields() throws {
         let empty = try decode(Snapshot.self, "{}")
         XCTAssertEqual(empty.title, "L — · ⚠ —")

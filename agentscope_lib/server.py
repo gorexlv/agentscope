@@ -2,7 +2,7 @@
 
 契约：runs/menubar-20261116/contract.md
 
-协议：每个连接一行 JSON 请求、一行 JSON 响应，超时 5s。
+协议：每个连接一行 JSON 请求、一行 JSON 响应，clean 超时 30s，其余 5s。
   {"op":"ping"}                            → {"ok":true,"version":"…"}
   {"op":"snapshot"}                        → {"ok":true,"snapshot":{…}}
   {"op":"clean","dry_run":true}            → {"ok":true,"token":"…","targets":[…]}
@@ -18,6 +18,10 @@
 """
 
 import copy
+import ctypes
+import struct
+import sys
+import subprocess
 import fcntl
 import stat
 import tempfile
@@ -32,9 +36,24 @@ import time
 from . import history
 
 TIMEOUT = 5.0
+CLEAN_TIMEOUT = 30.0
+MAX_CONNECTIONS = 8
 TOKEN_TTL = 60.0
 MAX_REQUEST = 65536
 _request_context = threading.local()
+
+
+def peer_uid(connection):
+    """Kernel credentials, never client-supplied identity; fail closed."""
+    if sys.platform == 'darwin':
+        uid, gid = ctypes.c_uint(), ctypes.c_uint()
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)):
+            raise OSError(ctypes.get_errno(), 'getpeereid failed')
+        return uid.value
+    if hasattr(socket, 'SO_PEERCRED'):
+        return struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+    raise OSError('peer credentials unsupported')
 
 
 def socket_path():
@@ -76,8 +95,12 @@ class SnapshotServer:
 
     def __init__(self, path=None, snapshot_provider=None, clean_targets=None,
                  clean_group=None, timeout=TIMEOUT, token_ttl=TOKEN_TTL,
-                 daemon_info=None, refresh_interval=15.0):
+                 daemon_info=None, refresh_interval=15.0, clean_cache=None,
+                 allow_cleanup=True):
         self.path = path or socket_path()
+        self.clean_cache = clean_cache
+        self.allow_cleanup = allow_cleanup
+        self._connections = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self.timeout = timeout
         self.token_ttl = token_ttl
         self.refresh_interval = refresh_interval
@@ -101,8 +124,16 @@ class SnapshotServer:
     def start(self):
         directory = os.path.dirname(self.path) or '.'
         os.makedirs(directory, mode=0o700, exist_ok=True)
-        lease = open(self.path + '.lock', 'a')
-        os.chmod(self.path + '.lock', 0o600)
+        directory_stat = os.stat(directory)
+        if directory_stat.st_uid != os.getuid() or directory_stat.st_mode & 0o022:
+            raise RuntimeError('state directory must be owned by current user and not writable by others')
+        descriptor = os.open(self.path + '.lock', os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        lease = os.fdopen(descriptor, 'a')
+        lease_stat = os.fstat(lease.fileno())
+        if not stat.S_ISREG(lease_stat.st_mode) or lease_stat.st_uid != os.getuid():
+            lease.close()
+            raise RuntimeError('invalid socket lease')
+        os.fchmod(lease.fileno(), 0o600)
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -213,15 +244,35 @@ class SnapshotServer:
                 continue
             except Exception:
                 continue
-            worker = threading.Thread(target=self._safe_handle, args=(connection,),
-                                      name='agentscope-socket-conn', daemon=True)
-            worker.start()
+            try:
+                if peer_uid(connection) != os.getuid():
+                    connection.close()
+                    continue
+            except OSError:
+                connection.close()
+                continue
+            if not self._connections.acquire(blocking=False):
+                connection.settimeout(0.05)
+                self._respond(connection, {'ok': False, 'error': 'busy, retry'})
+                connection.close()
+                continue
+            try:
+                worker = threading.Thread(target=self._safe_handle, args=(connection,),
+                                          name='agentscope-socket-conn', daemon=True)
+                worker.start()
+            except Exception:
+                connection.close()
+                self._connections.release()
+                continue
 
     def _safe_handle(self, connection):
         try:
             self._handle(connection)
         except Exception:
             pass
+        finally:
+            connection.close()
+            self._connections.release()
 
     def _handle(self, connection):
         try:
@@ -253,6 +304,9 @@ class SnapshotServer:
             if not isinstance(request, dict):
                 self._respond(connection, {'ok': False, 'error': 'invalid request'})
                 return
+            if request.get('op') == 'clean':
+                deadline = time.monotonic() + CLEAN_TIMEOUT
+                connection.settimeout(CLEAN_TIMEOUT)
             _request_context.deadline = deadline - 0.2
             self._respond(connection, self.dispatch(request))
         finally:
@@ -279,7 +333,15 @@ class SnapshotServer:
             if op == 'snapshot':
                 return {'ok': True, 'snapshot': self.snapshot_provider()}
             if op == 'clean':
-                return self._clean(request)
+                from .cleanup import CLEANUP_LOCK
+                if not CLEANUP_LOCK.acquire(blocking=False):
+                    return {'ok': False, 'error': 'busy, retry'}
+                try:
+                    return self._clean(request)
+                finally:
+                    CLEANUP_LOCK.release()
+        except (TimeoutError, subprocess.TimeoutExpired):
+            return {'ok': False, 'error': 'busy, retry'}
         except Exception as error:
             return {'ok': False, 'error': str(error)}
         return {'ok': False, 'error': 'unknown op'}
@@ -288,12 +350,20 @@ class SnapshotServer:
         if type(request.get('dry_run')) is not bool:
             return {'ok': False, 'error': 'dry_run must be a boolean'}
         if request['dry_run']:
-            groups = self.clean_targets()
+            cache = self.clean_cache() if self.clean_cache else None
+            interval = max(0.1, self.daemon_info.get('interval_s') or self.refresh_interval)
+            if cache is not None and 0 <= time.monotonic() - cache['monotonic'] <= 2 * interval:
+                groups, source, as_of = cache['groups'], 'cache', cache['as_of']
+            else:
+                groups, source = self.clean_targets(), 'live'
+                as_of = datetime.datetime.now().astimezone().isoformat()
             token = self._issue_token(groups)
             targets = [{'pgid': group['pgid'], 'size': group.get('size', 0),
                         'cwd': group.get('cwd'), 'names': group.get('names', [])}
                        for group in groups]
-            return {'ok': True, 'token': token, 'targets': targets}
+            return {'ok': True, 'token': token, 'targets': targets, 'source': source, 'as_of': as_of}
+        if not self.allow_cleanup:
+            return {'ok': False, 'error': 'daemon is in dry-run mode'}
         groups = self._consume_token(request.get('token'))
         if groups is None:
             return {'ok': False, 'error': 'invalid or expired token'}
@@ -341,9 +411,10 @@ class SnapshotServer:
 # 客户端helper（CLI 与 App 共用同一套语义）
 # ─────────────────────────────────────────────────────────────
 
-def request(payload, path=None, timeout=TIMEOUT):
+def request(payload, path=None, timeout=None):
     """发一行请求读一行响应；失败返回 None。"""
     path = path or socket_path()
+    timeout = timeout if timeout is not None else (CLEAN_TIMEOUT if payload.get('op') == 'clean' else TIMEOUT)
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(timeout)

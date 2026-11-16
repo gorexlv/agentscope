@@ -14,7 +14,16 @@ public struct Client {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw failure() }
         defer { close(fd) }
-        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        let budget: Double = request["op"] as? String == "clean" ? 30 : 5
+        let deadline = ProcessInfo.processInfo.systemUptime + budget
+        func updateTimeout() throws {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { throw ClientError.message("daemon 响应超时，请稍后重试") }
+            var value = timeval(tv_sec: Int(remaining), tv_usec: Int32((remaining - floor(remaining)) * 1_000_000))
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &value, socklen_t(MemoryLayout<timeval>.size))
+            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &value, socklen_t(MemoryLayout<timeval>.size))
+        }
+        var timeout = timeval(tv_sec: Int(budget), tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var noSignal: Int32 = 1
@@ -34,24 +43,30 @@ public struct Client {
         try payload.withUnsafeBytes { bytes in
             var sent = 0
             while sent < bytes.count {
+                try updateTimeout()
                 let count = send(fd, bytes.baseAddress!.advanced(by: sent), bytes.count - sent, 0)
                 guard count > 0 else { throw failure() }; sent += count
             }
         }
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 8192)
-        let deadline = Date().addingTimeInterval(5)
-        while data.count < 8 * 1024 * 1024, Date() < deadline {
+        while data.count < 8 * 1024 * 1024 {
+            try updateTimeout()
             let count = recv(fd, &buffer, buffer.count, 0)
             guard count > 0 else { throw failure() }
             data.append(contentsOf: buffer.prefix(count))
             if let end = data.firstIndex(of: 10) {
                 let reply = try JSONDecoder().decode(Reply.self, from: data[..<end])
-                guard reply.ok == true else { throw ClientError.message(reply.error ?? "Daemon 请求失败") }
+                guard reply.ok == true else { throw ClientError.message(reply.error?.contains("busy") == true ? "daemon 正忙，请稍后重试（不会自动重试清理）" : (reply.error ?? "Daemon 请求失败")) }
                 return reply
             }
         }
         throw ClientError.message("Daemon 响应超时或过大")
     }
-    private func failure() -> ClientError { .message(String(cString: strerror(errno))) }
+    private func failure() -> ClientError {
+        if errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT {
+            return .message("daemon 响应超时，请稍后重试")
+        }
+        return .message(String(cString: strerror(errno)))
+    }
 }

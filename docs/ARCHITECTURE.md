@@ -271,3 +271,9 @@ Unix socket 使用独立连接线程，单连接仅处理一个换行结尾的 J
 执行在锁内一次性消费 token（单调时钟 60 秒过期），只遍历 token 保存的组。
 `kill_group(expected=…, mode='socket')` 再次检查 cleanable、根进程和成员启动时间，沿用逐成员终止及审计。
 清理截止时间耗尽时保守跳过或报告 remaining，不扩大授权目标，也不因客户端重试再次消费 token。
+
+### Socket v1.1 safety and budgets
+
+`clean` has a 30-second budget; other operations retain 5 seconds. Preview uses the latest watch cleanable-group cache for at most twice the watch interval, or falls back to budgeted live analysis. Responses include `source` and `as_of`. Execution only revalidates groups and identities recorded in the single-use token. A shared reentrant lock serializes socket cleanup with watch analysis and cleanup; busy socket requests fail without consuming tokens. Global metadata caches are protected during analysis and revalidation.
+
+The server verifies kernel peer credentials, validates state-directory ownership and write permissions, opens its lease without following symlinks, and caps concurrent connection handlers at eight. Watch dry-run mode rejects real socket cleanup. Known remaining UI follow-ups are per-field recovery for type-invalid JSON and a stale-data indicator based on `generated_at`; missing/null fields and offline state are already handled.

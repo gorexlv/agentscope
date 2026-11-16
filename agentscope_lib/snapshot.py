@@ -74,9 +74,10 @@ def memory_usage():
             page = int(match.group(1)) if match else 0
             fields = {k: int(v) for k, v in
                       re.findall(r'^([^:\n]+):\s+(\d+)\.', result.stdout, re.MULTILINE)}
-            free = fields.get('Pages free', 0) * page
-            if page:
-                out['mem_used_pct'] = round(max(0.0, min(100.0, (total - free) / total * 100)), 1)
+            keys = ('Pages active', 'Pages wired down', 'Pages occupied by compressor')
+            if page and all(key in fields for key in keys):
+                used = sum(fields[key] for key in keys) * page
+                out['mem_used_pct'] = round(max(0.0, min(100.0, used / total * 100)), 1)
         except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired):
             pass
     try:
