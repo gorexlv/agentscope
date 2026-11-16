@@ -448,3 +448,23 @@ watch 内的周盘点在后台守护线程中执行，采用 90 秒预算，主�
 本地分支用 for-each-ref --merged 批量判断；已合入分支必然有远端可达证据，未合入分支的 unpushed 留空且拒绝删除。
 主仓库中的 .env 等 ignored 内容不阻断瘦身，它们始终保留；只有明确产物候选能被删。
 符号链接产物只计链接自身的磁盘大小，显式清理也只 unlink；即使目标位于工作区外，目标内容不会被遍历或删除。
+
+## 菜单栏 App
+
+macOS 14+ 可构建原生 `AgentscopeBar`，需要 Xcode Command Line Tools（Swift 5.9+），不依赖第三方库：
+
+```bash
+macos/build-app.sh
+open macos/build/AgentscopeBar.app
+```
+
+脚本仅在 `macos/build/` 生成 ad-hoc 签名的 App，不安装到 `/Applications`。
+菜单栏显示 1 分钟负载和告警数，warn 告警以橙色提示。展开菜单可查看会话、告警、孤儿组和可回收工作树；点击会话会在 Finder 打开其目录。工作树报告和 panel 会在 Terminal 执行 `agentscope worktrees` / `agentscope panel`，因此需先按本文安装 CLI 并确保终端能找到它；首次打开可能需要允许自动化 Terminal。
+
+App 优先连接 `$AGENTSCOPE_STATE_DIR/agentscope.sock`，默认目录为 `~/.local/state/agentscope`。socket 不可用时读取同目录 `snapshot.json`，顶部显示“daemon 未运行”，快照可能已过期；缺失字段显示“—”。App 不会自行启动 daemon，实时数据依赖 `agentscope watch`。可在菜单选择 2、5 或 15 秒刷新（默认 5 秒）。
+
+“清理孤儿组”先向 daemon 请求 dry run 并列出目标，点击“确认清理”后才使用预演令牌执行；令牌 60 秒过期且只能使用一次，daemon 执行前会再次校验目标。离线时不能清理。
+
+“登录时启动”使用 macOS `SMAppService`，仅在用户点击开关时注册或注销当前 App；系统要求批准时，到“系统设置 → 通用 → 登录项”允许。开启前请把 App 放在长期保留的位置，重新构建或移动 App 后可能需要重新设置；构建和测试不会修改登录项。
+
+核心测试：`cd macos/AgentscopeBar && swift build && swift test`。
